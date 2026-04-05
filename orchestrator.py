@@ -10,6 +10,25 @@ logger = get_logger("orchestrator")
 
 MAX_AI_CHARS = 3000
 
+# For CSVs specifically, sample rows from different parts of the file
+def sample_csv_text(text: str, max_chars: int = 3000) -> str:
+    """For large CSVs, take header + sample from beginning, middle, end."""
+    lines = text.strip().split("\n")
+    if len(lines) <= 20:
+        return text[:max_chars]
+
+    header = lines[0]
+    total = len(lines)
+
+    # Take header + ~5 rows each from start, middle, end
+    sampled = (
+        [header] +
+        lines[1:6] +           # start
+        lines[total//2:total//2+5] +  # middle
+        lines[-5:]             # end
+    )
+    return "\n".join(sampled)[:max_chars]
+
 
 def detect_document_type(text: str, filename: str) -> str:
     """Detect document type from content and filename."""
@@ -62,7 +81,10 @@ def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
     logger.info(f"Document type detected: {document_type}")
 
     # Step 3: Truncate for AI only after detection
-    text_for_ai = parsed["text"][:MAX_AI_CHARS]
+    if file_type == "csv":
+        text_for_ai = sample_csv_text(parsed["text"], MAX_AI_CHARS)
+    else:
+        text_for_ai = parsed["text"][:MAX_AI_CHARS]
     if len(parsed["text"]) > MAX_AI_CHARS:
         logger.warning(
             f"Text truncated to {MAX_AI_CHARS} chars | "
