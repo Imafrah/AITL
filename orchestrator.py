@@ -5,17 +5,24 @@ from ai_layer.extractor import extract_entities, AIServiceError
 from post_processor.processor import post_process, ValidationError
 from db.crud import save_document, DBError
 from logger import get_logger
+
 logger = get_logger("orchestrator")
 
-MAX_AI_CHARS = 3000  # Prevent token overflow for large files
+MAX_AI_CHARS = 3000
+
 
 def detect_document_type(text: str, filename: str) -> str:
+    """Detect document type from content and filename."""
     text_lower = text.lower()
     filename_lower = filename.lower()
 
     if any(k in text_lower or k in filename_lower
            for k in ["invoice", "inv-", "bill", "payment due", "amount due"]):
         return "invoice"
+
+    if any(k in text_lower or k in filename_lower
+           for k in ["employee", "emp", "salary", "department", "staff", "hr"]):
+        return "employee_record"
 
     if any(k in text_lower or k in filename_lower
            for k in ["transaction", "debit", "credit", "balance", "account"]):
@@ -30,6 +37,7 @@ def detect_document_type(text: str, filename: str) -> str:
         return "memo"
 
     return "unknown"
+
 
 def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
     api_key = os.getenv("GEMINI_API_KEY")
@@ -49,22 +57,24 @@ def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
             "metadata": {"file_type": file_type}
         }
 
-    # Step 2: AI Extraction
+    # Step 2: Detect document type from full text + filename
+    document_type = detect_document_type(parsed["text"], filename)
+    logger.info(f"Document type detected: {document_type}")
+
+    # Step 3: Truncate for AI only after detection
+    text_for_ai = parsed["text"][:MAX_AI_CHARS]
+    if len(parsed["text"]) > MAX_AI_CHARS:
+        logger.warning(
+            f"Text truncated to {MAX_AI_CHARS} chars | "
+            f"original={len(parsed['text'])} chars"
+        )
+
+    # Step 4: AI Extraction
     try:
-        # Truncate text to avoid token overflow on large files
-        text_for_ai = parsed["text"][:MAX_AI_CHARS]
-        was_truncated = len(parsed["text"]) > MAX_AI_CHARS
-        if was_truncated:
-            logger.warning(f"Text truncated to {MAX_AI_CHARS} chars for AI | original={len(parsed['text'])}")
-
-        # Auto-detect document type from filename
-        document_type = detect_document_type(text_for_ai, filename)
-        logger.info(f"Detected document type: {document_type}")
-
-        detected_type = detect_document_type(parsed["text"], filename)
-        logger.info(f"Document type detected: {detected_type}")
         ai_output = extract_entities(
-            parsed["text"], api_key=api_key, document_type=detected_type
+            text_for_ai,
+            api_key=api_key,
+            document_type=document_type
         )
         logger.info("AI extraction complete")
     except AIServiceError as e:
@@ -77,7 +87,7 @@ def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
             "metadata": parsed["metadata"]
         }
 
-    # Step 3: Post-Process
+    # Step 5: Post-Process
     try:
         result = post_process(
             ai_output,
@@ -95,7 +105,7 @@ def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
             "metadata": parsed["metadata"]
         }
 
-    # Step 4: Save to DB
+    # Step 6: Save to DB
     try:
         save_document(
             document_id=result["document_id"],

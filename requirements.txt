@@ -8,3 +8,4 @@ pandas
 pdfplumber
 google-genai
 thefuzz
+rapidfuzz

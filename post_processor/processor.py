@@ -5,36 +5,134 @@ from thefuzz import fuzz
 class ValidationError(Exception):
     pass
 
-def clean_llm_response(raw: str) -> str:
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        cleaned = "\n".join(lines).strip()
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+PAYMENT_METHODS = {
+    "paypal", "pay pal", "credit card", "creditcard", "credit_card",
+    "debit card", "cash", "visa", "mastercard", "master card",
+    "american express", "amex", "bank transfer", "wire transfer",
+    "stripe", "razorpay", "upi"
+}
+
+CURRENCY_MAP = {
+    "$": "USD", "usd": "USD",
+    "€": "EUR", "eur": "EUR",
+    "£": "GBP", "gbp": "GBP",
+    "₹": "INR", "inr": "INR",
+    "¥": "JPY", "jpy": "JPY",
+}
+
+LABEL_MAP = {
+    # Invoice labels
+    "amount": "invoice_total",
+    "total": "invoice_total",
+    "price": "invoice_total",
+    "fee": "invoice_total",
+    "payment": "invoice_total",
+    "subtotal": "subtotal",
+    "tax": "tax",
+    "discount": "discount",
+    # Employee labels
+    "salary": "salary",
+    "wage": "salary",
+    "compensation": "salary",
+    "bonus": "bonus",
+    # Generic
+    "revenue": "revenue",
+    "expense": "expense",
+    "cost": "cost",
+}
+
+DATE_FORMATS = [
+    "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y",
+    "%d/%m/%Y", "%Y/%m/%d", "%d %B %Y",
+    "%B %d, %Y", "%d %b %Y", "%b %d, %Y",
+]
+
+FUZZY_THRESHOLD = 85
+
+
+# ── Step 1: Schema Validator ──────────────────────────────────────────────────
+
+def validate_schema(ai_output: dict) -> dict:
+    """Ensure AI output has correct structure. Fill missing keys with defaults."""
+    return {
+        "document_type": ai_output.get("document_type", "unknown"),
+        "entities": {
+            "person_names": ai_output.get("entities", {}).get("person_names", []),
+            "organizations": ai_output.get("entities", {}).get("organizations", []),
+            "dates": ai_output.get("entities", {}).get("dates", []),
+            "amounts": ai_output.get("entities", {}).get("amounts", []),
+        },
+        "relationships": ai_output.get("relationships", []),
+    }
+
+
+# ── Step 2: Date Cleaner ──────────────────────────────────────────────────────
+
+def parse_date(value: str) -> str | None:
+    """Try all known formats. Return ISO date or None if invalid."""
+    value = str(value).strip()
+    for fmt in DATE_FORMATS:
+        try:
+            parsed = datetime.strptime(value, fmt)
+            if parsed.year < 1900 or parsed.year > 2100:
+                return None
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+def clean_dates(dates: list) -> list:
+    cleaned = []
+    for item in dates:
+        raw = str(item.get("value", ""))
+        parsed = parse_date(raw)
+        if parsed is None:
+            continue  # drop invalid dates
+        entry = {**item, "value": parsed}
+        if raw != parsed:
+            entry["original"] = raw  # preserve original for traceability
+        cleaned.append(entry)
     return cleaned
 
+
+# ── Step 3: Amount Cleaner ────────────────────────────────────────────────────
+
+def normalize_currency(currency: str) -> str:
+    return CURRENCY_MAP.get(currency.strip().lower(), currency.strip().upper())
+
 def normalize_label(label: str) -> str:
-    """Normalize AI-generated labels into standard vocabulary."""
-    label_map = {
-        "amount": "invoice_total",
-        "total": "invoice_total",
-        "price": "invoice_total",
-        "fee": "invoice_total",
-        "payment": "invoice_total",
-    }
-    return label_map.get(label.lower(), label.lower())
+    return LABEL_MAP.get(label.strip().lower(), label.strip().lower())
+
+def clean_amounts(amounts: list) -> list:
+    cleaned = []
+    for item in amounts:
+        value = item.get("value", 0)
+        entry = {
+            **item,
+            "currency": normalize_currency(item.get("currency", "")),
+            "label": normalize_label(item.get("label", "")),
+        }
+        if isinstance(value, (int, float)) and value < 0:
+            entry["flag"] = "negative_value"
+        cleaned.append(entry)
+    return cleaned
+
+
+# ── Step 4: Fuzzy Deduplication ───────────────────────────────────────────────
 
 def deduplicate_entities(entity_list: list) -> list:
-    """Merge duplicate entities using fuzzy string matching."""
+    """Merge duplicates using fuzzy string matching."""
     deduplicated = []
     for item in entity_list:
+        value = str(item.get("value", "")).lower().strip()
         matched = False
         for existing in deduplicated:
-            score = fuzz.ratio(
-                item["value"].lower().strip(),
-                existing["value"].lower().strip()
-            )
-            if score >= 85:
+            score = fuzz.ratio(value, str(existing.get("value", "")).lower().strip())
+            if score >= FUZZY_THRESHOLD:
+                # Keep higher confidence version
                 if item.get("confidence", 0) > existing.get("confidence", 0):
                     existing["value"] = item["value"]
                     existing["confidence"] = item["confidence"]
@@ -44,67 +142,122 @@ def deduplicate_entities(entity_list: list) -> list:
             deduplicated.append(item.copy())
     return deduplicated
 
-def assign_entity_ids(entities: dict) -> dict:
+
+# ── Step 5: Payment Method Separator ─────────────────────────────────────────
+
+def separate_payment_methods(organizations: list) -> tuple:
+    """Split orgs into real organizations and payment methods."""
+    orgs = []
+    payment_methods = []
+    for item in organizations:
+        value = str(item.get("value", "")).strip().lower()
+        if value in PAYMENT_METHODS:
+            payment_methods.append({
+                **item,
+                "value": item["value"].strip().title()
+            })
+        else:
+            orgs.append(item)
+    return orgs, payment_methods
+
+
+# ── Step 6: ID Assigner ───────────────────────────────────────────────────────
+
+def assign_entity_ids(entities: dict) -> tuple:
+    """Assign short IDs to every entity. Return enriched entities + id_map."""
     id_map = {}
     result = {}
-    counters = {"person_names": "p", "organizations": "o", "dates": "d", "amounts": "a"}
 
-    for entity_type, prefix in counters.items():
+    prefixes = {
+        "person_names": "p",
+        "organizations": "o",
+        "dates": "d",
+        "amounts": "a",
+        "payment_methods": "pm",
+    }
+
+    for entity_type, prefix in prefixes.items():
         items = entities.get(entity_type, [])
-        items = deduplicate_entities(items)  
         result[entity_type] = []
         for i, item in enumerate(items):
             entity_id = f"{prefix}{i+1}"
-            id_map[item.get("value", "")] = entity_id
-            enriched = {"id": entity_id, **item}
-            if entity_type == "amounts" and "label" in enriched:
-                enriched["label"] = normalize_label(enriched["label"])
-            result[entity_type].append(enriched)
+            raw_value = str(item.get("value", ""))
+            id_map[raw_value] = entity_id
+            id_map[raw_value.lower()] = entity_id
+            result[entity_type].append({"id": entity_id, **item})
 
     return result, id_map
 
+
+# ── Step 7: Relationship Mapper ───────────────────────────────────────────────
+
 def process_relationships(relationships: list, id_map: dict) -> list:
-    """Replace raw string references with entity IDs."""
     processed = []
     for rel in relationships:
+        from_val = rel.get("from", "")
+        to_val = rel.get("to", "")
         processed.append({
             "type": rel.get("type", "unknown"),
-            "from": id_map.get(rel.get("from", ""), rel.get("from", "")),
-            "to": id_map.get(rel.get("to", ""), rel.get("to", "")),
+            "from": id_map.get(from_val, id_map.get(from_val.lower(), from_val)),
+            "to": id_map.get(to_val, id_map.get(to_val.lower(), to_val)),
             "confidence": rel.get("confidence", 0.0),
             "attributes": rel.get("attributes", {})
         })
     return processed
 
+
+# ── Confidence Aggregator ─────────────────────────────────────────────────────
+
 def compute_overall_confidence(entities: dict) -> float:
-    """Average confidence across all entities."""
-    all_scores = []
-    for entity_list in entities.values():
-        for entity in entity_list:
-            if "confidence" in entity:
-                all_scores.append(entity["confidence"])
-    if not all_scores:
-        return 0.0
-    return round(sum(all_scores) / len(all_scores), 2)
+    scores = [
+        item["confidence"]
+        for entity_list in entities.values()
+        for item in entity_list
+        if "confidence" in item
+    ]
+    return round(sum(scores) / len(scores), 2) if scores else 0.0
+
+
+# ── Main Entry Point ──────────────────────────────────────────────────────────
 
 def post_process(ai_output: dict, source_file: str, file_metadata: dict) -> dict:
     try:
-        raw_entities = ai_output.get("entities", {})
-        raw_relationships = ai_output.get("relationships", [])
-        document_type = ai_output.get("document_type", "unknown")
+        # Step 1: Validate schema
+        data = validate_schema(ai_output)
 
-        # Assign IDs to entities
-        entities_with_ids, id_map = assign_entity_ids(raw_entities)
+        # Step 2: Clean dates
+        data["entities"]["dates"] = clean_dates(data["entities"]["dates"])
 
-        # Process relationships using ID map
-        relationships = process_relationships(raw_relationships, id_map)
+        # Step 3: Clean amounts
+        data["entities"]["amounts"] = clean_amounts(data["entities"]["amounts"])
 
-        # Compute overall confidence
+        # Step 4: Deduplicate person names and organizations
+        data["entities"]["person_names"] = deduplicate_entities(
+            data["entities"]["person_names"]
+        )
+        data["entities"]["organizations"] = deduplicate_entities(
+            data["entities"]["organizations"]
+        )
+
+        # Step 5: Separate payment methods from organizations
+        orgs, payment_methods = separate_payment_methods(
+            data["entities"]["organizations"]
+        )
+        data["entities"]["organizations"] = orgs
+        data["entities"]["payment_methods"] = deduplicate_entities(payment_methods)
+
+        # Step 6: Assign IDs
+        entities_with_ids, id_map = assign_entity_ids(data["entities"])
+
+        # Step 7: Map relationships
+        relationships = process_relationships(data["relationships"], id_map)
+
+        # Compute confidence
         confidence_overall = compute_overall_confidence(entities_with_ids)
 
         return {
             "document_id": str(uuid.uuid4()),
-            "document_type": document_type,
+            "document_type": data["document_type"],
             "source_file": source_file,
             "status": "success",
             "error": None,
