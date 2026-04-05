@@ -7,14 +7,22 @@ class AIServiceError(Exception):
 
 
 def clean_llm_response(raw: str) -> str:
-    """Remove markdown code fences if Gemini wraps output in them."""
     cleaned = raw.strip()
     if cleaned.startswith("```"):
         lines = cleaned.split("\n")
         lines = [l for l in lines if not l.strip().startswith("```")]
         cleaned = "\n".join(lines).strip()
+    
+    # If JSON is truncated, try to salvage it
+    if not cleaned.endswith("}"):
+        last_brace = cleaned.rfind("}")
+        if last_brace != -1:
+            cleaned = cleaned[:last_brace+1]
+            # Close any open brackets
+            open_brackets = cleaned.count("{") - cleaned.count("}")
+            cleaned += "}" * open_brackets
+    
     return cleaned
-
 
 def extract_entities(text: str, api_key: str, document_type: str = "unknown") -> dict:
     try:
