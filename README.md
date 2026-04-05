@@ -87,9 +87,9 @@ The result is a standardized, AI-ready JSON output that can be consumed by downs
 ┌─────────────────────────────────────────────────────────────┐
 │                   FastAPI Backend (Uvicorn)                   │
 │                  https://aitl.onrender.com                    │
-│                                                              │
+│                                                               │
 │  ┌─────────────────────────────────────────────────────────┐ │
-│  │                   API Routes Layer                       │ │
+│  │                   API Routes Layer                      │ │
 │  │         File validation · Size checks · Routing         │ │
 │  └────────────────────────┬────────────────────────────────┘ │
 │                           │                                  │
@@ -148,6 +148,20 @@ The pipeline follows a **4-step sequential flow** with error handling at each st
 | **Render** | Backend hosting |
 | **Vercel** | Frontend hosting |
 
+---
+ 
+## ❌ Out of Scope (v1)
+ 
+These are deliberately excluded from v1:
+ 
+- Scanned / image-based PDFs (requires OCR)
+- Word documents (.docx)
+- Email files (.eml, .msg)
+- Multi-language support (English only)
+- Authentication / API keys
+- Batch file uploads
+- Vector / semantic search
+ 
 ---
 
 ## 📁 Project Structure
