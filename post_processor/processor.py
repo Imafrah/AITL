@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime, timezone
+from thefuzz import fuzz
 
 class ValidationError(Exception):
     pass
@@ -23,26 +24,41 @@ def normalize_label(label: str) -> str:
     }
     return label_map.get(label.lower(), label.lower())
 
+def deduplicate_entities(entity_list: list) -> list:
+    """Merge duplicate entities using fuzzy string matching."""
+    deduplicated = []
+    for item in entity_list:
+        matched = False
+        for existing in deduplicated:
+            score = fuzz.ratio(
+                item["value"].lower().strip(),
+                existing["value"].lower().strip()
+            )
+            if score >= 85:
+                if item.get("confidence", 0) > existing.get("confidence", 0):
+                    existing["value"] = item["value"]
+                    existing["confidence"] = item["confidence"]
+                matched = True
+                break
+        if not matched:
+            deduplicated.append(item.copy())
+    return deduplicated
+
 def assign_entity_ids(entities: dict) -> dict:
-    """Assign short IDs to each entity."""
     id_map = {}
     result = {}
-
     counters = {"person_names": "p", "organizations": "o", "dates": "d", "amounts": "a"}
 
     for entity_type, prefix in counters.items():
         items = entities.get(entity_type, [])
+        items = deduplicate_entities(items)  
         result[entity_type] = []
         for i, item in enumerate(items):
             entity_id = f"{prefix}{i+1}"
             id_map[item.get("value", "")] = entity_id
-
             enriched = {"id": entity_id, **item}
-
-            # Normalize label for amounts
             if entity_type == "amounts" and "label" in enriched:
                 enriched["label"] = normalize_label(enriched["label"])
-
             result[entity_type].append(enriched)
 
     return result, id_map

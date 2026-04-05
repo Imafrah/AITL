@@ -9,20 +9,27 @@ logger = get_logger("orchestrator")
 
 MAX_AI_CHARS = 3000  # Prevent token overflow for large files
 
-def detect_document_type(filename: str) -> str:
-    """Auto-detect document type from filename."""
-    name = filename.lower()
-    if "invoice" in name:
-        return "invoice"
-    elif any(w in name for w in ["emp", "employee", "staff", "hr"]):
-        return "employee_record"
-    elif "contract" in name:
-        return "contract"
-    elif "report" in name:
-        return "report"
-    else:
-        return "unknown"
+def detect_document_type(text: str, filename: str) -> str:
+    text_lower = text.lower()
+    filename_lower = filename.lower()
 
+    if any(k in text_lower or k in filename_lower
+           for k in ["invoice", "inv-", "bill", "payment due", "amount due"]):
+        return "invoice"
+
+    if any(k in text_lower or k in filename_lower
+           for k in ["transaction", "debit", "credit", "balance", "account"]):
+        return "financial_report"
+
+    if any(k in text_lower or k in filename_lower
+           for k in ["agreement", "contract", "terms", "party", "clause"]):
+        return "contract"
+
+    if any(k in text_lower or k in filename_lower
+           for k in ["memo", "subject:", "re:"]):
+        return "memo"
+
+    return "unknown"
 
 def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
     api_key = os.getenv("GEMINI_API_KEY")
@@ -51,7 +58,7 @@ def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
             logger.warning(f"Text truncated to {MAX_AI_CHARS} chars for AI | original={len(parsed['text'])}")
 
         # Auto-detect document type from filename
-        document_type = detect_document_type(filename)
+        document_type = detect_document_type(text_for_ai, filename)
         logger.info(f"Detected document type: {document_type}")
 
         ai_output = extract_entities(
