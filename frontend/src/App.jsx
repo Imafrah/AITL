@@ -17,7 +17,7 @@ export default function App() {
     formData.append("file", file)
 
     try {
-      const res = await axios.post("/translate", formData)
+      const res = await axios.post("https://aitl.onrender.com/translate", formData)
       setResult(res.data)
     } catch (err) {
       setError(err.response?.data?.detail || "Something went wrong.")
