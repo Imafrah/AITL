@@ -61,8 +61,10 @@ def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
         document_type = detect_document_type(text_for_ai, filename)
         logger.info(f"Detected document type: {document_type}")
 
+        detected_type = detect_document_type(parsed["text"], filename)
+        logger.info(f"Document type detected: {detected_type}")
         ai_output = extract_entities(
-            text_for_ai, api_key=api_key, document_type=document_type
+            parsed["text"], api_key=api_key, document_type=detected_type
         )
         logger.info("AI extraction complete")
     except AIServiceError as e:
