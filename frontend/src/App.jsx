@@ -113,6 +113,20 @@ export default function App() {
 
           {/* Raw JSON */}
           <h2 style={styles.sectionTitle}>Raw JSON</h2>
+          <button
+            onClick={() => {
+              const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" })
+              const url = URL.createObjectURL(blob)
+              const a = document.createElement("a")
+              a.href = url
+              a.download = `${result.document_id}.json`
+              a.click()
+              URL.revokeObjectURL(url)
+            }}
+            style={styles.downloadBtn}
+          >
+            ⬇ Download JSON
+          </button>
           <pre style={styles.jsonBox}>
             {JSON.stringify(result, null, 2)}
           </pre>
@@ -179,4 +193,15 @@ const styles = {
   metaKey: { color: "#64748b", fontSize: 13 },
   metaVal: { color: "#e2e8f0", fontSize: 13 },
   jsonBox: { background: "#1e293b", borderRadius: 10, padding: 20, fontSize: 12, overflowX: "auto", color: "#94a3b8", lineHeight: 1.6 },
+  downloadBtn: {
+    background: "#1e293b",
+    color: "#94a3b8",
+    border: "1px solid #334155",
+    borderRadius: 8,
+    padding: "8px 20px",
+    fontSize: 14,
+    cursor: "pointer",
+    marginBottom: 12,
+    fontWeight: 600
+  },
 }

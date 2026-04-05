@@ -7,6 +7,22 @@ from db.crud import save_document, DBError
 from logger import get_logger
 logger = get_logger("orchestrator")
 
+MAX_AI_CHARS = 3000  # Prevent token overflow for large files
+
+def detect_document_type(filename: str) -> str:
+    """Auto-detect document type from filename."""
+    name = filename.lower()
+    if "invoice" in name:
+        return "invoice"
+    elif any(w in name for w in ["emp", "employee", "staff", "hr"]):
+        return "employee_record"
+    elif "contract" in name:
+        return "contract"
+    elif "report" in name:
+        return "report"
+    else:
+        return "unknown"
+
 
 def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
     api_key = os.getenv("GEMINI_API_KEY")
@@ -28,8 +44,18 @@ def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
 
     # Step 2: AI Extraction
     try:
+        # Truncate text to avoid token overflow on large files
+        text_for_ai = parsed["text"][:MAX_AI_CHARS]
+        was_truncated = len(parsed["text"]) > MAX_AI_CHARS
+        if was_truncated:
+            logger.warning(f"Text truncated to {MAX_AI_CHARS} chars for AI | original={len(parsed['text'])}")
+
+        # Auto-detect document type from filename
+        document_type = detect_document_type(filename)
+        logger.info(f"Detected document type: {document_type}")
+
         ai_output = extract_entities(
-            parsed["text"], api_key=api_key, document_type="invoice"
+            text_for_ai, api_key=api_key, document_type=document_type
         )
         logger.info("AI extraction complete")
     except AIServiceError as e:
