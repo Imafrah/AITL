@@ -10,6 +10,8 @@ MAX_FILE_SIZE = 10 * 1024 * 1024
 
 @router.post("/translate")
 async def translate(file: UploadFile = File(...)):
+    import os
+
     ext = file.filename.split(".")[-1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=422,
@@ -24,7 +26,16 @@ async def translate(file: UploadFile = File(...)):
         raise HTTPException(status_code=422,
             detail="File is empty.")
 
-    result = run_pipeline(content, ext, file.filename)
+    if not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(status_code=500,
+            detail="Server configuration error: GEMINI_API_KEY is not set.")
+
+    try:
+        result = run_pipeline(content, ext, file.filename)
+    except Exception as e:
+        raise HTTPException(status_code=500,
+            detail=f"Processing failed: {str(e)}")
+
     return result
 
 

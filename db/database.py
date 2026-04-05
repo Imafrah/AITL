@@ -7,7 +7,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+
+if not DATABASE_URL:
+    print("WARNING: DATABASE_URL not set. Using local SQLite database (aitl.db).")
+    DATABASE_URL = "sqlite:///aitl.db"
+elif DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(DATABASE_URL)
