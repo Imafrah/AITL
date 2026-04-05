@@ -1,0 +1,7 @@
+INVOICE #1001
+Date: 12 January 2024
+From: John Doe
+To: ABC Corp
+Amount: INR 5,000
+Description: Web development services for Q4 2023
+Payment Due: 30 January 2024
