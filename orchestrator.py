@@ -8,31 +8,36 @@ from logger import get_logger
 
 logger = get_logger("orchestrator")
 
-MAX_AI_CHARS = 3000
+MAX_AI_CHARS = 10000
 
-# For CSVs specifically, sample rows from different parts of the file
-def sample_csv_text(text: str, max_chars: int = 3000) -> str:
-    """For large CSVs, take header + sample from beginning, middle, end."""
+
+def sample_csv_text(text: str, max_chars: int = 10000) -> str:
+    """
+    For large CSVs: take header + samples from beginning, middle, end.
+    Ensures representative data reaches the AI layer.
+    """
     lines = text.strip().split("\n")
-    if len(lines) <= 20:
+    if len(lines) <= 50:
         return text[:max_chars]
 
     header = lines[0]
     total = len(lines)
 
-    # Take header + ~5 rows each from start, middle, end
     sampled = (
         [header] +
-        lines[1:6] +           # start
-        lines[total//2:total//2+5] +  # middle
-        lines[-5:]             # end
+        lines[1:20] +                       # first 19 rows
+        lines[total // 2:total // 2 + 10] + # 10 rows from middle
+        lines[-10:]                         # last 10 rows
     )
     return "\n".join(sampled)[:max_chars]
 
 
 def detect_document_type(text: str, filename: str) -> str:
-    """Detect document type from content and filename."""
-    text_lower = text.lower()
+    """
+    Detect document type from content keywords and filename.
+    Runs on FULL text before truncation for accuracy.
+    """
+    text_lower = text[:5000].lower()  # check first 5000 chars only for speed
     filename_lower = filename.lower()
 
     if any(k in text_lower or k in filename_lower
@@ -40,19 +45,22 @@ def detect_document_type(text: str, filename: str) -> str:
         return "invoice"
 
     if any(k in text_lower or k in filename_lower
-           for k in ["employee", "emp", "salary", "department", "staff", "hr"]):
+           for k in ["employee", "employer", "emp_", "salary", "department",
+                     "dept", "staff", "hr_", "joining", "date_of_birth", "dob"]):
         return "employee_record"
 
     if any(k in text_lower or k in filename_lower
-           for k in ["transaction", "debit", "credit", "balance", "account"]):
+           for k in ["transaction", "debit", "credit", "balance", "account",
+                     "financial", "ledger", "statement"]):
         return "financial_report"
 
     if any(k in text_lower or k in filename_lower
-           for k in ["agreement", "contract", "terms", "party", "clause"]):
+           for k in ["agreement", "contract", "terms", "party", "clause",
+                     "signed", "hereby"]):
         return "contract"
 
     if any(k in text_lower or k in filename_lower
-           for k in ["memo", "subject:", "re:"]):
+           for k in ["memo", "subject:", "re:", "memorandum"]):
         return "memo"
 
     return "unknown"
@@ -80,11 +88,12 @@ def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
     document_type = detect_document_type(parsed["text"], filename)
     logger.info(f"Document type detected: {document_type}")
 
-    # Step 3: Truncate for AI only after detection
+    # Step 3: Truncate for AI only AFTER detection
     if file_type == "csv":
         text_for_ai = sample_csv_text(parsed["text"], MAX_AI_CHARS)
     else:
         text_for_ai = parsed["text"][:MAX_AI_CHARS]
+
     if len(parsed["text"]) > MAX_AI_CHARS:
         logger.warning(
             f"Text truncated to {MAX_AI_CHARS} chars | "
