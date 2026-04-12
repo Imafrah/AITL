@@ -10,6 +10,7 @@ from post_processor.processor import convert_to_toml
 
 from core.output_formatter import to_csv_file
 from core.universal_pipeline import process_universal
+from parsers.csv_robust import CSVParsingError
 
 router = APIRouter()
 
@@ -71,6 +72,8 @@ async def translate(
             fmt,
             os.getenv("GEMINI_API_KEY"),
         )
+    except CSVParsingError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500,
             detail=f"Processing failed: {str(e)}")

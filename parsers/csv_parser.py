@@ -697,10 +697,12 @@ def parse_csv_documents(file_bytes: bytes, api_key: str | None = None) -> list[d
     except UnicodeDecodeError:
         content = file_bytes.decode("latin-1")
 
-    reader = csv.DictReader(io.StringIO(content))
-    raw_headers = reader.fieldnames or []
-    fieldnames = [str(f).strip() for f in raw_headers if f is not None and str(f).strip()]
-    rows = list(reader)
+    from parsers.csv_robust import CSVParsingError, parse_csv_text_to_rows
+
+    try:
+        fieldnames, rows = parse_csv_text_to_rows(content)
+    except CSVParsingError as e:
+        raise ParseError(str(e)) from e
 
     schema = _detect_csv_schema(fieldnames)
     logger.info("CSV schema=%s | headers=%s | rows=%s", schema, fieldnames, len(rows))

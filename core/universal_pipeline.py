@@ -155,9 +155,6 @@ def _process_structured_csv(
     filename: str,
     api_key: str | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
-    import csv
-    import io
-
     from core.schema_inference import (
         heuristic_row_without_mapping,
         infer_mapping_from_columns,
@@ -165,19 +162,14 @@ def _process_structured_csv(
         mapping_to_universal_row,
     )
     from parsers.csv_parser import clean_csv_row
+    from parsers.csv_robust import parse_csv_text_to_rows
 
     try:
         content = file_bytes.decode("utf-8-sig")
     except UnicodeDecodeError:
         content = file_bytes.decode("latin-1")
 
-    reader = csv.DictReader(io.StringIO(content))
-    raw_headers = reader.fieldnames or []
-    columns = [str(f).strip() for f in raw_headers if f is not None and str(f).strip()]
-    all_rows = list(reader)
-
-    if not columns:
-        return [], {"file_type": "csv", "document_type": "unknown", "raw_text": content[:100_000]}, "failed"
+    columns, all_rows = parse_csv_text_to_rows(content)
 
     cached = get_schema_from_memory(columns)
     sample: list[dict[str, Any]] = []
