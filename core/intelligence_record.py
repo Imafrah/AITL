@@ -15,16 +15,11 @@ from core.cleaning import (
     is_valid_date,
     is_valid_email,
     is_valid_numeric,
-    is_valid_phone,
     normalize_city,
     normalize_date_value,
     normalize_status_value,
 )
-from core.semantic_mapping import (
-    classify_fields,
-    detect_dataset_type,
-    dynamic_semantic_map,
-)
+from core.semantic_mapping import classify_fields, dynamic_semantic_map
 from parsers.csv_parser import normalize_field_name
 
 _LEGACY_KEYS = frozenset({"person_name", "organization", "amount", "is_outlier"})
@@ -104,64 +99,24 @@ def _quantity_parsed(raw: Any) -> float | int | None:
     return float(n)
 
 
-def _resolve_output_amount(
-    sem: dict[str, Any],
-    dataset_type: str,
-    field_map: dict[str, list[str]],
-) -> tuple[float | None, Any]:
-    """Choose monetary amount without ever using quantity. Employee prefers salary_comp."""
-    dt = (dataset_type or "generic").lower()
-    raw_sal = sem.get("salary_comp")
+def _resolve_output_amount(sem: dict[str, Any]) -> tuple[float | None, Any]:
+    """Prefer general monetary columns (sorted) then compensation-style columns — never quantity."""
     raw_amt = sem.get("amount_monetary")
-
-    if dt == "employee" and field_map.get("salary_comp") and raw_sal is not None:
-        v = amount_from_value(raw_sal)
-        if v is not None:
-            return v, raw_sal
-
+    raw_sal = sem.get("salary_comp")
     if raw_amt is not None:
         v = amount_from_value(raw_amt)
         if v is not None:
             return v, raw_amt
-
-    if dt != "employee" and raw_sal is not None:
+    if raw_sal is not None:
         v = amount_from_value(raw_sal)
         if v is not None:
             return v, raw_sal
-
-    if raw_sal is not None:
-        v = amount_from_value(raw_sal)
-        return v, raw_sal
-
     return None, None
-
-
-def _confidence_for_semantic_record(
-    rec: dict[str, Any],
-    *,
-    schema_source: str,
-) -> float:
-    base = {"memory": 0.96, "ai": 0.9, "heuristic": 0.82, "migrated": 0.84}.get(
-        schema_source, 0.85
-    )
-    pn = rec.get("person_name") or rec.get("name")
-    if pn and rec.get("email") and not is_valid_email(rec.get("email")):
-        base -= 0.06
-    if rec.get("email") and is_valid_email(rec.get("email")):
-        base = min(1.0, base + 0.02)
-    if rec.get("phone") and not is_valid_phone(rec.get("phone")):
-        base -= 0.04
-    if rec.get("phone") and is_valid_phone(rec.get("phone")):
-        base = min(1.0, base + 0.01)
-    if not (pn or rec.get("email") or rec.get("phone")):
-        base -= 0.12
-    return max(0.0, min(1.0, base))
 
 
 def semantic_intelligence_row(
     row: dict[str, Any],
     field_map: dict[str, list[str]],
-    dataset_type: str,
     *,
     schema_source: str = "heuristic",
 ) -> dict[str, Any]:
@@ -180,7 +135,7 @@ def semantic_intelligence_row(
     qty_raw = sem.get("quantity")
     quantity = _quantity_parsed(qty_raw)
 
-    amount, amt_raw = _resolve_output_amount(sem, dataset_type, field_map)
+    amount, amt_raw = _resolve_output_amount(sem)
 
     date_raw = sem.get("date")
     date_val = normalize_date_value(date_raw)
@@ -202,14 +157,10 @@ def semantic_intelligence_row(
     if status:
         rec["status"] = status
     if location:
-        rec["location"] = location
         rec["city"] = location
 
     if person_name:
         rec["name"] = person_name
-
-    if (dataset_type or "").lower() == "employee" and amount is not None:
-        rec["salary"] = amount
 
     # Validation flags
     rec["is_valid_email"] = bool(email and is_valid_email(email))
@@ -227,7 +178,8 @@ def semantic_intelligence_row(
         amt_ok = is_valid_numeric(amt_raw)
     rec["is_valid_numeric"] = qty_ok and amt_ok
 
-    rec["confidence"] = _confidence_for_semantic_record(rec, schema_source=schema_source)
+    _ = schema_source  # reserved for future provenance boosts; confidence finalized in pipeline
+    rec["confidence"] = 1.0
     rec["is_anomaly"] = False
 
     for nk, v in preserved.items():
@@ -245,18 +197,16 @@ def mapped_intelligence_row(
     mapping: dict[str, Any],
     *,
     schema_source: str = "heuristic",
-    dataset_type: str = "generic",
 ) -> dict[str, Any]:
     """Backward-compatible entry when caller has a merged field_map (same as semantic)."""
     fm = {k: (v if isinstance(v, list) else [v]) for k, v in mapping.items() if v}
-    return semantic_intelligence_row(row, fm, dataset_type, schema_source=schema_source)
+    return semantic_intelligence_row(row, fm, schema_source=schema_source)
 
 
 def heuristic_intelligence_row(row: dict[str, Any]) -> dict[str, Any]:
     keys = [k for k in row.keys() if k is not None]
-    dt = detect_dataset_type([str(k) for k in keys])
     fm = classify_fields([str(k) for k in keys])
-    return semantic_intelligence_row(row, fm, dt, schema_source="heuristic")
+    return semantic_intelligence_row(row, fm, schema_source="heuristic")
 
 
 def coerce_intelligence_row(d: dict[str, Any]) -> dict[str, Any]:

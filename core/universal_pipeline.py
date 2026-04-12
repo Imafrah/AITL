@@ -18,19 +18,17 @@ from core.dashboard_formatter import build_dashboard
 from core.file_router import route_file as classify_file
 from core.intelligence_record import coerce_intelligence_row, dedupe_intelligence_rows
 from core.output_formatter import to_table
+from core.schema_cleanup import (
+    clean_schema,
+    compute_adaptive_confidence,
+    infer_critical_fields,
+    validate_row_numeric_aggregate,
+)
 from core.schema_memory import get_schema_from_memory, save_schema_to_memory
 
 logger = logging.getLogger(__name__)
 
 MAX_CSV_ROWS = int(__import__("os").getenv("AITL_MAX_CSV_ROWS", "100000"))
-
-
-def _infer_dataset_type_from_document(document_type: str) -> str:
-    t = (document_type or "").lower()
-    for k in ("invoice", "employee", "transaction", "sales"):
-        if k in t:
-            return k
-    return "generic"
 
 
 def structured_doc_to_row(doc: dict[str, Any]) -> dict[str, Any]:
@@ -156,7 +154,6 @@ def _process_structured_csv(
     from core.intelligence_record import heuristic_intelligence_row, semantic_intelligence_row
     from core.semantic_mapping import (
         classify_fields,
-        detect_dataset_type,
         field_map_needs_ai,
         field_map_nonempty,
         merge_field_maps,
@@ -181,7 +178,6 @@ def _process_structured_csv(
 
     memory_hit = False
     base_fm = classify_fields(columns)
-    dataset_type = detect_dataset_type(columns)
     field_map: dict[str, list[str]] = {k: list(v) for k, v in base_fm.items() if v}
     schema_source = "heuristic"
 
@@ -192,9 +188,6 @@ def _process_structured_csv(
             cached.get("field_map") or cached.get("mapping"),
         )
         field_map = {k: v for k, v in field_map.items() if v}
-        dataset_type = str(
-            cached.get("dataset_type") or cached.get("schema_type") or dataset_type
-        )
         schema_source = str(cached.get("source") or "memory")
 
     if not memory_hit:
@@ -207,19 +200,14 @@ def _process_structured_csv(
                 merged = merge_field_maps(field_map, ai_m)
                 if field_map_nonempty(merged):
                     field_map = {k: v for k, v in merged.items() if v}
-                    st = str(ai.get("schema_type", "")).lower()
-                    if st in ("employee", "invoice", "transaction", "sales", "generic"):
-                        dataset_type = st
                     schema_source = "ai"
-                    logger.info("Schema from AI | type=%s", dataset_type)
+                    logger.info("Schema from AI | roles=%s", list(field_map.keys())[:15])
             except Exception as ex:
                 logger.warning("AI schema detection failed: %s", ex)
 
         payload = {
             "field_map": field_map,
             "mapping": field_map,
-            "dataset_type": dataset_type,
-            "schema_type": dataset_type,
             "source": schema_source,
         }
         save_schema_to_memory(columns, payload)
@@ -240,7 +228,6 @@ def _process_structured_csv(
                     semantic_intelligence_row(
                         row,
                         field_map,
-                        dataset_type,
                         schema_source=schema_source,
                     )
                 )
@@ -256,8 +243,8 @@ def _process_structured_csv(
 
     meta = {
         "file_type": "csv",
-        "document_type": dataset_type,
-        "dataset_type": dataset_type,
+        "document_type": "tabular",
+        "semantic_map": field_map,
         "column_count": len(columns),
         "schema_source": schema_source,
         "from_cache": memory_hit,
@@ -403,17 +390,44 @@ def process_universal(
     else:
         data, meta, st = _process_structured_csv(file_bytes, filename, api_key)
 
-    if meta.get("dataset_type") is None:
-        meta["dataset_type"] = _infer_dataset_type_from_document(
-            str(meta.get("document_type", ""))
-        )
-
-    dataset_type = str(meta.get("dataset_type") or "generic")
-
     data = [coerce_intelligence_row(r) for r in data]
     data = dedupe_intelligence_rows(data)
-    apply_anomaly_detection(data, dataset_type=dataset_type)
-    analytics = compute_analytics(data, dataset_type=dataset_type)
+
+    semantic_map = meta.get("semantic_map") or {}
+    cleaned: list[dict[str, Any]] = []
+    norm_flags: list[bool] = []
+    for r in data:
+        cr, had_norm = clean_schema(r, semantic_map)
+        cr["is_valid_numeric"] = validate_row_numeric_aggregate(cr)
+        cleaned.append(cr)
+        norm_flags.append(had_norm)
+    data = cleaned
+
+    if semantic_map:
+        logger.info("Semantic grouping applied")
+    if any(norm_flags):
+        logger.info("Duplicate fields removed")
+
+    critical = infer_critical_fields(data)
+    meta["critical_fields"] = critical
+    apply_anomaly_detection(data, critical_fields=critical)
+    _anomaly_n = sum(1 for r in data if r.get("is_anomaly"))
+    if _anomaly_n:
+        logger.info(
+            "Anomaly detected based on dynamic rules | affected_records=%s",
+            _anomaly_n,
+        )
+    any_conf_adj = False
+    for r, had_norm in zip(data, norm_flags):
+        conf, adj = compute_adaptive_confidence(
+            r, critical, had_schema_normalization=had_norm
+        )
+        r["confidence"] = conf
+        if adj:
+            any_conf_adj = True
+    if any_conf_adj:
+        logger.info("Confidence adjusted dynamically")
+    analytics = compute_analytics(data)
     validation_summary = {
         "valid_email_count": sum(1 for r in data if is_valid_email(r.get("email"))),
         "valid_phone_count": sum(1 for r in data if is_valid_phone(r.get("phone"))),
@@ -428,10 +442,24 @@ def process_universal(
         from core.fallback_extractor import fallback_extract
 
         logger.warning("Empty data after processing; injecting fallback placeholder")
-        data = [coerce_intelligence_row(r) for r in fallback_extract("")]
+        raw_fb = [coerce_intelligence_row(r) for r in fallback_extract("")]
         st = "partial"
-        apply_anomaly_detection(data, dataset_type=dataset_type)
-        analytics = compute_analytics(data, dataset_type=dataset_type)
+        fb_clean, fb_norms = [], []
+        for r in raw_fb:
+            cr, hn = clean_schema(r, semantic_map)
+            cr["is_valid_numeric"] = validate_row_numeric_aggregate(cr)
+            fb_clean.append(cr)
+            fb_norms.append(hn)
+        data = fb_clean
+        critical_fb = infer_critical_fields(data)
+        meta["critical_fields"] = critical_fb
+        apply_anomaly_detection(data, critical_fields=critical_fb)
+        for r, hn in zip(data, fb_norms):
+            conf, _ = compute_adaptive_confidence(
+                r, critical_fb, had_schema_normalization=hn
+            )
+            r["confidence"] = conf
+        analytics = compute_analytics(data)
         validation_summary = {
             "valid_email_count": sum(1 for r in data if is_valid_email(r.get("email"))),
             "valid_phone_count": sum(1 for r in data if is_valid_phone(r.get("phone"))),

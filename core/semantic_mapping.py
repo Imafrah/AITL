@@ -1,75 +1,16 @@
 """
-Context-aware semantic column classification: keyword similarity (no exact-name tables),
-dataset-type hints, and row-level semantic extraction. Extensible via keyword sets only.
+Dataset-agnostic semantic column classification: keyword similarity on normalized headers,
+row-level semantic extraction. No dataset-type labels — roles are generic.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
 from parsers.csv_parser import normalize_field_name
 
 logger = logging.getLogger(__name__)
-
-# --- Dataset-type signals (substring / token overlap on normalized headers) -----------------
-_DATASET_KEYWORDS: dict[str, frozenset[str]] = {
-    "invoice": frozenset(
-        {
-            "invoice",
-            "billing",
-            "product",
-            "sku",
-            "line",
-            "quantity",
-            "qty",
-            "purchase",
-            "tax_id",
-            "po_",
-            "vendor_bill",
-            "receipt",
-        }
-    ),
-    "employee": frozenset(
-        {
-            "salary",
-            "department",
-            "employee",
-            "hire",
-            "payroll",
-            "staff",
-            "position",
-            "job_title",
-            "dob",
-            "benefits",
-            "compensation",
-            "wage",
-        }
-    ),
-    "transaction": frozenset(
-        {
-            "transaction",
-            "payment",
-            "merchant",
-            "card",
-            "txn",
-            "transfer",
-            "reference",
-            "authorization",
-        }
-    ),
-    "sales": frozenset(
-        {
-            "sales",
-            "revenue",
-            "order",
-            "customer_id",
-            "ship",
-            "fulfill",
-        }
-    ),
-}
 
 # Semantic roles (priority order for assignment: first match wins per column).
 # quantity is strictly separated from monetary amount / salary.
@@ -214,35 +155,6 @@ def _header_matches_keywords(norm_header: str, keywords: frozenset[str]) -> bool
         if norm_header.startswith(kw + "_") or norm_header.endswith("_" + kw):
             return True
     return False
-
-
-def detect_dataset_type(columns: list[str]) -> str:
-    """
-    Score dataset kinds from normalized header tokens (keyword overlap).
-    Returns one of: invoice, employee, transaction, sales, generic.
-    """
-    norms = [normalize_field_name(str(c)) for c in columns if c is not None and str(c).strip()]
-    if not norms:
-        return "generic"
-
-    best = "generic"
-    best_score = 0
-    for dtype, kws in _DATASET_KEYWORDS.items():
-        score = 0
-        for col in norms:
-            for kw in kws:
-                if len(kw) >= 3 and kw in col:
-                    score += 2
-                elif col == kw:
-                    score += 3
-        if score > best_score:
-            best_score = score
-            best = dtype
-
-    if best_score == 0:
-        return "generic"
-    logger.info("Detected dataset type: %s (score=%s)", best, best_score)
-    return best
 
 
 def classify_fields(columns: list[str]) -> dict[str, list[str]]:
