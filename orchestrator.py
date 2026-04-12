@@ -10,15 +10,20 @@ from logger import get_logger
 
 logger = get_logger("orchestrator")
 
-MAX_AI_CHARS = 10000
+# Full file is always parsed + cleaned; this limit is only how much text is sent to the model.
+MAX_AI_CHARS = int(os.getenv("AITL_MAX_AI_CHARS", "32000"))
 
 
 def sample_csv_text(text: str, max_chars: int = 10000) -> str:
     """
-    For large CSVs: take header + samples from beginning, middle, end.
-    Ensures representative data reaches the AI layer.
+    Prefer sending the entire cleaned CSV to the AI if it fits under max_chars.
+    Otherwise take header + samples from beginning, middle, and end.
     """
-    lines = text.strip().split("\n")
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+
+    lines = text.split("\n")
     if len(lines) <= 50:
         return text[:max_chars]
 
@@ -26,10 +31,10 @@ def sample_csv_text(text: str, max_chars: int = 10000) -> str:
     total = len(lines)
 
     sampled = (
-        [header] +
-        lines[1:20] +                       # first 19 rows
-        lines[total // 2:total // 2 + 10] + # 10 rows from middle
-        lines[-10:]                         # last 10 rows
+        [header]
+        + lines[1:20]
+        + lines[total // 2 : total // 2 + 10]
+        + lines[-10:]
     )
     return "\n".join(sampled)[:max_chars]
 

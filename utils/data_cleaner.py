@@ -2,6 +2,9 @@ import re
 
 import pandas as pd
 
+# Zero-width / BOM / soft hyphen (common in exports and PDF paste)
+_UNICODE_NOISE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff\u00ad]+")
+
 # ── Universal Text Cleaner (works on PDF, TXT, CSV text) ─────────────────────
 
 # Common garbage patterns found in real-world documents
@@ -35,6 +38,37 @@ BOILERPLATE_REGEX = [
 ]
 
 
+def strip_unicode_noise(s: str) -> str:
+    """Remove BOM, zero-width chars, soft hyphens; normalize NBSP to space."""
+    if not s:
+        return s
+    t = _UNICODE_NOISE.sub("", s)
+    t = t.replace("\ufeff", "").replace("\u00a0", " ")
+    return t
+
+
+def clean_dirty_cell(s: str) -> str:
+    """
+    Heavy cleaning for a single field (CSV cell, short attribute).
+    Does not assume line breaks are meaningful structure.
+    """
+    if not s or not isinstance(s, str):
+        return s
+    t = strip_unicode_noise(s.strip())
+    t = t.replace("\x00", "")
+    # Smart quotes / dashes (same as TXT path)
+    t = t.replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
+    t = t.replace("\u2013", "-").replace("\u2014", "--")
+    for pattern in GARBAGE_PATTERNS[:7]:
+        t = re.sub(pattern, " ", t)
+    for phrase in BOILERPLATE_LITERALS:
+        t = re.sub(re.escape(phrase), "", t, flags=re.IGNORECASE)
+    for pat in BOILERPLATE_REGEX:
+        t = re.sub(pat, "", t, flags=re.IGNORECASE)
+    t = re.sub(r"[^\S\n]+", " ", t).strip()
+    return t
+
+
 def clean_universal_text(text: str) -> str:
     """
     Universal text cleaner for any document type (PDF, TXT, CSV).
@@ -59,10 +93,10 @@ def clean_universal_text(text: str) -> str:
     # Remove excessive blank lines (more than 2 in a row)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # Normalize whitespace within lines
+    # Normalize horizontal whitespace within lines (tabs, NBSP, unicode spaces)
     lines = []
     for line in text.split("\n"):
-        line = re.sub(r"[ \t]+", " ", line).strip()
+        line = re.sub(r"[^\S\n]+", " ", line).strip()
         lines.append(line)
     text = "\n".join(lines)
 
@@ -169,8 +203,7 @@ def clean_csv_row(row: dict) -> dict:
                 cleaned[key] = v
                 continue
 
-        s = str(v).strip()
-        s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", s)
+        s = clean_dirty_cell(str(v))
         cleaned[key] = s if s else None
 
     # Light normalization for department-style columns
