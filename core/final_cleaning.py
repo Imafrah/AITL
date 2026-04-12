@@ -1,6 +1,10 @@
 """
-Final cleaning layer: schema-complete rows, invalid-value repair, numeric imputation,
-row-quality filtering, normalization, and duplicate-row removal — fully dataset-agnostic.
+Final cleaning layer — dataset-agnostic, conservative ETL-style repair.
+
+Policy is driven by :class:`CleaningConfig` (environment variables), including
+clean mode (``safe`` / ``strict``), email handling (``none`` / ``remove_row`` / ``placeholder``),
+optional text sentinels, median imputation thresholds, and optional ``__imputed__`` lineage.
+Never bulk-fills phone-like or near-unique identifier columns.
 """
 
 from __future__ import annotations
@@ -10,14 +14,16 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from core.cleaning import (
     amount_from_value,
     clean_name,
     is_valid_date,
     is_valid_email,
+    is_valid_phone,
     normalize_city,
     normalize_date_value,
     normalize_status_value,
@@ -38,9 +44,69 @@ _RESERVED_KEYS = frozenset(
     }
 )
 
+# Internal / lineage keys — never imputed, excluded from missing-rate denominators.
+_INTERNAL_KEYS = frozenset({"__imputed__"})
+
 # Keys used only for QC / scoring — excluded from "missing rate" so rows are not
 # penalized for synthetic boolean fields.
-_RATIO_EXCLUDED_KEYS = _RESERVED_KEYS | frozenset({"is_outlier"})
+_RATIO_EXCLUDED_KEYS = _RESERVED_KEYS | frozenset({"is_outlier"}) | _INTERNAL_KEYS
+
+
+@dataclass(frozen=True)
+class CleaningConfig:
+    """
+    Env-driven cleaning policy (no dataset-specific table names).
+
+    * ``AITL_CLEAN_MODE``: ``safe`` (default) | ``strict`` — strict uses a lower
+      missing-value threshold for row drops.
+    * ``AITL_EMAIL_INVALID_STRATEGY``: ``none`` (default) | ``remove_row`` | ``placeholder``
+    * ``AITL_EMAIL_PLACEHOLDER``: placeholder address when strategy is ``placeholder``
+    * ``AITL_TEXT_MISSING_PLACEHOLDER``: if non-empty, fill **only** missing *text* cells
+      (never phones / high-cardinality identifiers).
+    * ``AITL_TRACK_IMPUTATION``: ``1`` (default) | ``0`` — add per-row ``__imputed__`` map.
+    * ``AITL_MIN_VALUES_FOR_MEDIAN``: minimum count of observed numeric values required
+      before median imputation is allowed (default ``3``).
+    """
+
+    clean_mode: str
+    email_invalid_strategy: str
+    email_placeholder: str
+    text_missing_placeholder: str | None
+    track_imputation: bool
+    min_values_for_median: int
+
+    @staticmethod
+    def from_env() -> CleaningConfig:
+        mode = os.getenv("AITL_CLEAN_MODE", "safe").strip().lower()
+        if mode not in ("safe", "strict"):
+            mode = "safe"
+        estrat = os.getenv("AITL_EMAIL_INVALID_STRATEGY", "none").strip().lower()
+        if estrat not in ("none", "remove_row", "placeholder"):
+            estrat = "none"
+        ph = (os.getenv("AITL_EMAIL_PLACEHOLDER") or "unknown@example.invalid").strip()
+        if not is_valid_email(ph):
+            ph = "unknown@example.invalid"
+        txt_ph = (os.getenv("AITL_TEXT_MISSING_PLACEHOLDER") or "").strip()
+        txt_out: str | None = txt_ph if txt_ph else None
+        track = os.getenv("AITL_TRACK_IMPUTATION", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        try:
+            min_med = int(os.getenv("AITL_MIN_VALUES_FOR_MEDIAN", "3"))
+        except ValueError:
+            min_med = 3
+        min_med = max(2, min_med)
+        return CleaningConfig(
+            clean_mode=mode,
+            email_invalid_strategy=estrat,
+            email_placeholder=ph,
+            text_missing_placeholder=txt_out,
+            track_imputation=track,
+            min_values_for_median=min_med,
+        )
 
 
 def enforce_schema(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -237,7 +303,9 @@ def detect_field_types(records: list[dict[str, Any]]) -> dict[str, set[str]]:
     keys = [
         k
         for k in records[0].keys()
-        if k not in _RESERVED_KEYS and not str(k).startswith("_")
+        if k not in _RESERVED_KEYS
+        and k not in _INTERNAL_KEYS
+        and not str(k).startswith("__")
     ]
     n = len(records)
 
@@ -302,6 +370,81 @@ def detect_field_types(records: list[dict[str, Any]]) -> dict[str, set[str]]:
     return out
 
 
+def _detect_phone_like_columns(records: list[dict[str, Any]], keys: Iterable[str]) -> set[str]:
+    """Columns whose values look like phone numbers — never bulk-imputed or text-filled."""
+    out: set[str] = set()
+    for k in keys:
+        filled: list[str] = []
+        for r in records:
+            v = r.get(k)
+            if not _is_present(v):
+                continue
+            filled.append(str(v).strip())
+        if not filled:
+            continue
+        hit = 0
+        for v in filled:
+            if is_valid_phone(v):
+                hit += 1
+                continue
+            digits = re.sub(r"\D+", "", v)
+            if 10 <= len(digits) <= 15 and len(digits) >= len(v) * 0.45:
+                hit += 1
+        if hit / len(filled) >= 0.5:
+            out.add(k)
+    return out
+
+
+def _should_skip_numeric_bulk_impute(records: list[dict[str, Any]], k: str) -> bool:
+    """
+    Identifier-like / near-unique numeric columns: do not fabricate repeated values.
+    """
+    vals: list[float] = []
+    for r in records:
+        v = r.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            vals.append(float(v))
+    n = len(vals)
+    if n < 2:
+        return True
+    distinct = len({round(v, 6) for v in vals})
+    if n <= 24 and distinct >= n - 1:
+        return True
+    if n >= 5 and distinct / n >= 0.92:
+        return True
+    return False
+
+
+def _schema_key_order(all_keys: Iterable[str], *, include_imputed_slot: bool) -> list[str]:
+    keys = list(all_keys)
+    content = sorted(
+        k
+        for k in keys
+        if k not in _RESERVED_KEYS and k not in _INTERNAL_KEYS and not str(k).startswith("__")
+    )
+    reserved = sorted(k for k in keys if k in _RESERVED_KEYS)
+    other = sorted(
+        k
+        for k in keys
+        if k not in content and k not in reserved and k not in _INTERNAL_KEYS
+    )
+    out = content + reserved + other
+    if include_imputed_slot and "__imputed__" not in out:
+        out.append("__imputed__")
+    return out
+
+
+def _reorder_record_keys(row: dict[str, Any], key_order: list[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k in key_order:
+        if k in row:
+            out[k] = row[k]
+    for k, v in row.items():
+        if k not in out:
+            out[k] = v
+    return out
+
+
 def _median(vals: list[float]) -> float | None:
     if not vals:
         return None
@@ -310,12 +453,6 @@ def _median(vals: list[float]) -> float | None:
     if len(s) % 2:
         return float(s[m])
     return float(s[m - 1] + s[m]) / 2.0
-
-
-def _mean(vals: list[float]) -> float | None:
-    if not vals:
-        return None
-    return sum(vals) / len(vals)
 
 
 def _normalize_strings_inplace(record: dict[str, Any]) -> None:
@@ -374,19 +511,31 @@ def _dedupe_identical_rows(records: list[dict[str, Any]]) -> tuple[list[dict[str
 
 def run_final_cleaning_layer(
     records: list[dict[str, Any]],
+    *,
+    config: CleaningConfig | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
-    Full production pass on a **copy** of rows (caller may keep the original for
-    validated / annotated views). Returns ``(cleaned_rows, stats)``.
+    Production pass on a **copy** of rows: conservative imputation, optional email policy,
+    no synthetic IDs/phones, optional ``__imputed__`` lineage. ``config`` defaults to
+    :meth:`CleaningConfig.from_env`.
     """
+    cfg = config or CleaningConfig.from_env()
+    rows_in = len(records)
     stats: dict[str, Any] = {
-        "rows_in": len(records),
+        "rows_in": rows_in,
         "rows_out": 0,
+        "clean_mode": cfg.clean_mode,
+        "email_invalid_strategy": cfg.email_invalid_strategy,
         "invalid_values_replaced": False,
         "missing_values_filled": False,
         "low_quality_removed": 0,
         "duplicate_rows_removed": 0,
         "field_types": {"numeric": [], "email": [], "text": []},
+        "cleaning_summary": {
+            "rows_removed": 0,
+            "values_filled": 0,
+            "invalid_values_fixed": 0,
+        },
     }
     if not records:
         return [], stats
@@ -394,88 +543,172 @@ def run_final_cleaning_layer(
     logger.info("Final cleaning started")
 
     working = copy.deepcopy(records)
+    for r in working:
+        r.pop("__imputed__", None)
+
     working = enforce_schema(working)
     logger.info("Schema enforced")
 
     schema_keys = list(working[0].keys())
+    missing_threshold = 0.25 if cfg.clean_mode == "strict" else 0.5
+
     field_types = detect_field_types(working)
     stats["field_types"] = {
         "numeric": sorted(field_types["numeric"]),
         "email": sorted(field_types["email"]),
         "text": sorted(field_types["text"]),
     }
-    numeric_cols = field_types["numeric"]
-    email_cols = field_types["email"]
+    numeric_cols = set(field_types["numeric"])
+    email_cols = set(field_types["email"])
+    text_cols = set(field_types["text"])
 
+    content_keys = [
+        k
+        for k in schema_keys
+        if k not in _RESERVED_KEYS and k not in _INTERNAL_KEYS and not str(k).startswith("__")
+    ]
+    phone_like = _detect_phone_like_columns(working, content_keys)
+    # Digit-heavy strings (phones) must not be classified or coerced as plain numbers.
+    for k in phone_like & numeric_cols:
+        numeric_cols.remove(k)
+        text_cols.add(k)
+
+    invalid_fixed_cells = 0
     invalid_changed = False
+
     for r in working:
         for k in list(r.keys()):
-            if k in _RESERVED_KEYS:
+            if k in _RESERVED_KEYS or k in _INTERNAL_KEYS or str(k).startswith("__"):
                 continue
             v = r.get(k)
             if k in email_cols and v is not None and str(v).strip():
                 if not is_valid_email(str(v)):
                     r[k] = None
                     invalid_changed = True
+                    if cfg.email_invalid_strategy != "placeholder":
+                        invalid_fixed_cells += 1
             elif k in numeric_cols:
                 if v is None or (isinstance(v, str) and not str(v).strip()):
                     r[k] = None
                 else:
+                    before = r.get(k)
                     coerced = _coerce_number(v)
                     if coerced is None and _is_present(v):
                         invalid_changed = True
+                        invalid_fixed_cells += 1
+                    elif coerced != before and _is_present(before):
+                        invalid_fixed_cells += 1
                     r[k] = coerced
+
     if invalid_changed:
         logger.info("Invalid values replaced")
 
+    skip_numeric_impute = {k for k in numeric_cols if _should_skip_numeric_bulk_impute(working, k)}
+    skip_numeric_impute |= phone_like & numeric_cols
+
+    # Email placeholder (explicit opt-in — documented as synthetic marker).
+    if cfg.email_invalid_strategy == "placeholder":
+        for r in working:
+            for k in email_cols:
+                if not _is_present(r.get(k)):
+                    r[k] = cfg.email_placeholder
+                    invalid_fixed_cells += 1
+
+    values_filled_cells = 0
+    text_ph_cells = 0
     filled_any = False
+
     for k in numeric_cols:
+        if k in skip_numeric_impute:
+            continue
         vals: list[float] = []
         for r in working:
             v = r.get(k)
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 vals.append(float(v))
-        med = _median(vals)
-        mean_v = _mean(vals)
-        fill_value: float | int | None = med if med is not None else mean_v
-        if fill_value is None:
+        if len(vals) < cfg.min_values_for_median:
             continue
-        filled_any = True
+        med = _median(vals)
+        if med is None:
+            continue
+        fill_value: float | int = int(med) if med == int(med) and abs(med) < 1e12 else float(med)
         for r in working:
             if r.get(k) is None:
-                if isinstance(fill_value, float) and fill_value == int(fill_value):
-                    r[k] = int(fill_value)
-                else:
-                    r[k] = fill_value
-
-    if filled_any:
-        logger.info("Missing values filled")
-    stats["missing_values_filled"] = filled_any
+                r[k] = fill_value
+                filled_any = True
+                values_filled_cells += 1
+                if cfg.track_imputation:
+                    im = r.setdefault("__imputed__", {})
+                    im[k] = True
 
     before_filter = len(working)
     kept: list[dict[str, Any]] = []
     for r in working:
-        if _missing_ratio(r, schema_keys) > 0.5:
+        if _missing_ratio(r, schema_keys) > missing_threshold:
             continue
+        if cfg.email_invalid_strategy == "remove_row":
+            drop = False
+            for ek in email_cols:
+                if not _is_present(r.get(ek)) or not is_valid_email(str(r.get(ek))):
+                    drop = True
+                    break
+            if drop:
+                continue
         kept.append(r)
     removed = before_filter - len(kept)
     if removed:
         logger.info("Low-quality rows removed")
     stats["low_quality_removed"] = removed
+
     working = kept
 
     for r in working:
         _normalize_strings_inplace(r)
+        if cfg.text_missing_placeholder and text_cols:
+            for k in text_cols:
+                if k in phone_like | email_cols:
+                    continue
+                if not _is_present(r.get(k)):
+                    r[k] = cfg.text_missing_placeholder
+                    text_ph_cells += 1
+                    values_filled_cells += 1
         _refresh_validation_flags(r)
-        # Surviving rows passed repair + QC filters; stale anomaly flags are misleading downstream.
         r["is_anomaly"] = False
+
+    if filled_any or text_ph_cells:
+        logger.info("Missing values filled")
+    stats["missing_values_filled"] = bool(filled_any or text_ph_cells)
+
+    union_keys: set[str] = set(schema_keys)
+    for r in working:
+        union_keys |= set(r.keys())
+    for r in working:
+        for k in union_keys:
+            if k not in r:
+                r[k] = None
 
     working, dup_removed = _dedupe_identical_rows(working)
     stats["duplicate_rows_removed"] = dup_removed
 
-    working = enforce_schema(working)
+    key_order = _schema_key_order(union_keys, include_imputed_slot=cfg.track_imputation)
+    if cfg.track_imputation:
+        for r in working:
+            if not r.get("__imputed__"):
+                r.pop("__imputed__", None)
+        working = [_reorder_record_keys(r, key_order) for r in working]
+    else:
+        for r in working:
+            r.pop("__imputed__", None)
+        working = [_reorder_record_keys(r, [k for k in key_order if k != "__imputed__"]) for r in working]
+
+    rows_out = len(working)
     stats["invalid_values_replaced"] = invalid_changed
-    stats["rows_out"] = len(working)
+    stats["rows_out"] = rows_out
+    stats["cleaning_summary"] = {
+        "rows_removed": rows_in - rows_out,
+        "values_filled": values_filled_cells,
+        "invalid_values_fixed": invalid_fixed_cells,
+    }
     return working, stats
 
 

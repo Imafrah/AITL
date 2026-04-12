@@ -391,6 +391,11 @@ def process_universal(
                     "valid_date_count": 0,
                     "valid_numeric_count": 0,
                 },
+                "cleaning_summary": {
+                    "rows_removed": 0,
+                    "values_filled": 0,
+                    "invalid_values_fixed": 0,
+                },
             },
         }
 
@@ -521,6 +526,7 @@ def process_universal(
         "metadata": {
             **intermediate_metadata,
             "final_cleaning": cleaning_stats,
+            "cleaning_summary": cleaning_stats.get("cleaning_summary", {}),
             "cleaned_row_count": len(cleaned_data),
             "output_paths": output_paths,
         },
