@@ -150,7 +150,9 @@ export default function App() {
             {Object.entries(result.metadata || {}).map(([k, v]) => (
               <div key={k} style={styles.metaRow}>
                 <span style={styles.metaKey}>{k}</span>
-                <span style={styles.metaVal}>{String(v)}</span>
+                <span style={styles.metaVal}>
+                  {typeof v === "object" && v !== null ? JSON.stringify(v) : String(v)}
+                </span>
               </div>
             ))}
           </div>
