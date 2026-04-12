@@ -23,7 +23,18 @@ export default function App() {
 
     try {
       const res = await axios.post(`${API_BASE}/translate`, formData)
-      setResult(res.data)
+      const data = res.data
+      // CSV pipeline returns an array of documents; UI expects one object.
+      if (Array.isArray(data)) {
+        if (data.length === 0) {
+          setError("No documents returned from CSV.")
+          setResult(null)
+        } else {
+          setResult(data[0])
+        }
+      } else {
+        setResult(data)
+      }
     } catch (err) {
       setError(err.response?.data?.detail || "Something went wrong.")
     } finally {
@@ -62,7 +73,7 @@ export default function App() {
       )}
 
       {/* Results */}
-      {result && (
+      {result && typeof result === "object" && !Array.isArray(result) && (
         <div style={styles.resultContainer}>
 
           {/* Status Badge */}
@@ -72,7 +83,7 @@ export default function App() {
               background: result.status === "success" ? "#22c55e"
                 : result.status === "partial" ? "#f59e0b" : "#ef4444"
             }}>
-              {result.status.toUpperCase()}
+              {String(result.status ?? "unknown").toUpperCase()}
             </span>
             <span style={styles.docId}>ID: {result.document_id}</span>
           </div>
@@ -97,7 +108,7 @@ export default function App() {
                     <span style={styles.relArrow}>→ {rel.type} →</span>
                     <span style={styles.relTag}>{rel.to}</span>
                     <span style={styles.confidence}>
-                      {(rel.confidence * 100).toFixed(0)}%
+                      {((rel.confidence ?? 0) * 100).toFixed(0)}%
                     </span>
                   </div>
                 ))}
@@ -177,12 +188,12 @@ function EntityGroup({ label, items, color }) {
           <div style={styles.confBarBg}>
             <div style={{
               ...styles.confBarFill,
-              width: `${item.confidence * 100}%`,
+              width: `${(item.confidence ?? 0) * 100}%`,
               background: color
             }} />
           </div>
           <span style={styles.confText}>
-            {(item.confidence * 100).toFixed(0)}%
+            {((item.confidence ?? 0) * 100).toFixed(0)}%
           </span>
         </div>
       ))}
