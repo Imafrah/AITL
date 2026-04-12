@@ -129,6 +129,23 @@ def entities_to_universal_rows(entities: dict[str, Any]) -> list[dict[str, Any]]
     return out
 
 
+def _mapping_covers_few_roles(mapping: dict[str, Any]) -> bool:
+    """True when we should still try AI (heuristic too thin)."""
+    from core.schema_inference import mapping_is_non_empty
+
+    if not mapping_is_non_empty(mapping):
+        return True
+    filled = sum(1 for v in mapping.values() if v)
+    return filled < 2
+
+
+def _csv_cache_is_usable(cached: dict[str, Any]) -> bool:
+    """Trust cache when it has a modern envelope or an explicit mapping dict (incl. empty)."""
+    if "source" in cached:
+        return True
+    return isinstance(cached.get("mapping"), dict)
+
+
 def _process_structured_csv(
     file_bytes: bytes,
     filename: str,
@@ -137,19 +154,13 @@ def _process_structured_csv(
     import csv
     import io
 
-    from parsers.csv_parser import (
-        _apply_aliases,
-        _detect_csv_schema,
-        _EMPLOYEE_ALIASES,
-        _SALES_ALIASES,
-        _TRANSACTION_ALIASES,
-        clean_csv_row,
-        process_ai_mapped_row,
-        process_employee_row,
-        process_generic_tabular_row,
-        process_sales_row,
-        process_transaction_row,
+    from core.schema_inference import (
+        heuristic_row_without_mapping,
+        infer_mapping_from_columns,
+        mapping_is_non_empty,
+        mapping_to_universal_row,
     )
+    from parsers.csv_parser import clean_csv_row
 
     try:
         content = file_bytes.decode("utf-8-sig")
@@ -165,45 +176,52 @@ def _process_structured_csv(
         return [], {"file_type": "csv", "document_type": "unknown", "raw_text": content[:100_000]}, "failed"
 
     cached = get_schema_from_memory(columns)
-    rule_schema = _detect_csv_schema(columns)
-    effective: dict[str, Any] | None = None
+    sample: list[dict[str, Any]] = []
+    for raw in all_rows[:40]:
+        if any(str(v).strip() for v in raw.values() if v is not None):
+            sample.append(clean_csv_row(dict(raw)))
+        if len(sample) >= 8:
+            break
 
-    if cached:
-        logger.info("Using cached schema (memory hit) | cols=%s", len(columns))
-        effective = cached
-    elif rule_schema != "generic":
-        effective = {"handler": rule_schema, "mapping": None, "schema_type": rule_schema}
-        save_schema_to_memory(columns, effective)
-        logger.info("Schema saved (rule-based) | handler=%s", rule_schema)
-    else:
-        sample: list[dict[str, Any]] = []
-        for raw in all_rows[:40]:
-            if any(str(v).strip() for v in raw.values() if v is not None):
-                sample.append(clean_csv_row(dict(raw)))
-            if len(sample) >= 5:
-                break
-        effective = {"handler": "generic", "mapping": None, "schema_type": "generic"}
-        if sample and api_key and str(api_key).strip():
+    memory_hit = False
+    mapping: dict[str, Any] = {}
+    schema_type = "generic"
+    schema_source = "heuristic"
+
+    if cached and _csv_cache_is_usable(cached):
+        memory_hit = True
+        mapping = dict(cached.get("mapping") or {})
+        schema_type = str(cached.get("schema_type") or cached.get("handler") or "generic")
+        schema_source = str(cached.get("source") or "memory")
+        logger.info("Schema memory hit | cols=%s | mapped_roles=%s", len(columns), bool(mapping))
+
+    if not memory_hit:
+        mapping = infer_mapping_from_columns(columns)
+        schema_type = str(
+            (cached or {}).get("schema_type") or (cached or {}).get("handler") or "generic"
+        )
+        schema_source = "heuristic"
+
+        if _mapping_covers_few_roles(mapping) and sample and api_key and str(api_key).strip():
             try:
                 from ai_layer.schema_detector import detect_schema_ai
 
                 ai = detect_schema_ai(sample, api_key)
-                m = ai.get("mapping") or {}
-                if m:
-                    effective = {
-                        "handler": "mapped",
-                        "mapping": m,
-                        "schema_type": ai.get("schema_type", "generic"),
-                    }
-                    save_schema_to_memory(columns, effective)
-                    logger.info("Schema saved (AI) | type=%s", effective["schema_type"])
+                ai_m = ai.get("mapping") or {}
+                if mapping_is_non_empty(ai_m):
+                    mapping = ai_m
+                    schema_type = str(ai.get("schema_type") or schema_type)
+                    schema_source = "ai"
+                    logger.info("Schema from AI | type=%s", schema_type)
             except Exception as ex:
                 logger.warning("AI schema detection failed: %s", ex)
 
-    assert effective is not None
-    handler = effective.get("handler") or "generic"
-    mapping = effective.get("mapping") or {}
-    schema_type = effective.get("schema_type") or "generic"
+        payload = {
+            "mapping": mapping,
+            "schema_type": schema_type,
+            "source": schema_source,
+        }
+        save_schema_to_memory(columns, payload)
 
     data_rows: list[dict[str, Any]] = []
     status = "success"
@@ -216,19 +234,12 @@ def _process_structured_csv(
             continue
         row = clean_csv_row(dict(raw_row))
         try:
-            if handler == "transaction":
-                doc = process_transaction_row(_apply_aliases(row, _TRANSACTION_ALIASES), idx + 1)
-            elif handler == "employee":
-                doc = process_employee_row(_apply_aliases(row, _EMPLOYEE_ALIASES), idx + 1)
-            elif handler == "sales":
-                doc = process_sales_row(_apply_aliases(row, _SALES_ALIASES), idx + 1)
-            elif handler == "mapped" and mapping:
-                doc = process_ai_mapped_row(row, mapping, str(schema_type), idx + 1)
+            if mapping_is_non_empty(mapping):
+                data_rows.append(
+                    mapping_to_universal_row(row, mapping, schema_source=schema_source)
+                )
             else:
-                doc = process_generic_tabular_row(row, idx + 1)
-            if doc.get("status") == "failed":
-                status = "partial"
-            data_rows.extend(document_to_universal_rows(doc))
+                data_rows.append(heuristic_row_without_mapping(row))
         except Exception as ex:
             logger.exception("CSV row error: %s", ex)
             status = "partial"
@@ -237,13 +248,12 @@ def _process_structured_csv(
     if not data_rows and status == "success":
         status = "partial"
 
-    doc_type = str(schema_type) if handler == "mapped" else handler
     meta = {
         "file_type": "csv",
-        "document_type": doc_type,
+        "document_type": schema_type,
         "column_count": len(columns),
-        "schema_handler": handler,
-        "from_cache": bool(cached),
+        "schema_source": schema_source,
+        "from_cache": memory_hit,
         "raw_text": content[:100_000],
     }
     return data_rows, meta, status
@@ -252,12 +262,13 @@ def _process_structured_csv(
 def _process_unstructured(
     file_bytes: bytes,
     filename: str,
-    api_key: str,
+    api_key: str | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
     from parsers.router import route_file
     from parsers.txt_parser import ParseError
 
     from ai_layer.extractor import AIServiceError, extract_entities
+    from core.fallback_extractor import fallback_extract
     from orchestrator import MAX_AI_CHARS, detect_document_type, sample_csv_text
     from post_processor.processor import ValidationError, post_process
 
@@ -265,7 +276,18 @@ def _process_unstructured(
     try:
         parsed = route_file(file_bytes, ext)
     except ParseError as e:
-        return [], {"file_type": ext, "document_type": "unknown", "error": str(e), "raw_text": ""}, "failed"
+        rows = fallback_extract("")
+        return (
+            rows,
+            {
+                "file_type": ext,
+                "document_type": "unknown",
+                "error": str(e),
+                "raw_text": "",
+                "extraction": "fallback",
+            },
+            "partial",
+        )
 
     document_type = detect_document_type(parsed["text"], filename)
     if ext == "csv":
@@ -273,48 +295,62 @@ def _process_unstructured(
     else:
         text_for_ai = parsed["text"][:MAX_AI_CHARS]
 
+    raw_slice = parsed.get("text", "")[:500_000]
+    base_meta: dict[str, Any] = {
+        "file_type": ext,
+        "document_type": document_type,
+        "word_count": parsed.get("metadata", {}).get("word_count"),
+        "raw_text": raw_slice,
+    }
+
+    def _with_fallback(err: str | None) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+        logger.warning("AI failed, using fallback extraction")
+        rows_fb = fallback_extract(text_for_ai)
+        meta_fb = {**base_meta, "extraction": "fallback"}
+        if err:
+            meta_fb["error"] = err
+        logger.info("Fallback extraction completed")
+        return rows_fb, meta_fb, "partial"
+
+    if not api_key or not str(api_key).strip():
+        rows_fb = fallback_extract(text_for_ai)
+        meta_fb = {
+            **base_meta,
+            "extraction": "fallback",
+            "error": "GEMINI_API_KEY not set; heuristic extraction only.",
+        }
+        logger.info("Fallback extraction completed (no API key)")
+        return rows_fb, meta_fb, "partial"
+
     try:
         ai_output = extract_entities(
             text_for_ai,
             api_key=api_key,
             document_type=document_type,
         )
+    except AIServiceError as e:
+        return _with_fallback(str(e))
+
+    try:
         result = post_process(
             ai_output,
             source_file=filename,
             file_metadata=parsed["metadata"],
         )
-    except (AIServiceError, ValidationError) as e:
-        return (
-            [],
-            {
-                "file_type": ext,
-                "document_type": document_type,
-                "error": str(e),
-                "raw_text": parsed.get("text", "")[:500_000],
-            },
-            "partial",
-        )
+    except ValidationError as e:
+        return _with_fallback(str(e))
     except Exception as e:
-        logger.exception("Unstructured pipeline error")
-        return (
-            [],
-            {
-                "file_type": ext,
-                "document_type": document_type,
-                "error": str(e),
-                "raw_text": parsed.get("text", "")[:500_000],
-            },
-            "failed",
-        )
+        logger.exception("Unstructured post_process error")
+        return _with_fallback(str(e))
 
     rows = entities_to_universal_rows(result.get("entities") or {})
     meta = {
-        "file_type": ext,
+        **base_meta,
         "document_type": result.get("document_type", document_type),
-        "word_count": parsed.get("metadata", {}).get("word_count"),
-        "raw_text": parsed.get("text", "")[:500_000],
+        "extraction": "ai",
     }
+    if result.get("error"):
+        meta["error"] = str(result["error"])
     return rows, meta, str(result.get("status", "success"))
 
 
@@ -347,19 +383,6 @@ def process_universal(
         }
 
     if kind == "unstructured":
-        if not api_key or not str(api_key).strip():
-            return {
-                "document_id": document_id,
-                "document_type": "unknown",
-                "status": "failed",
-                "error": "GEMINI_API_KEY is required for TXT/PDF processing.",
-                "data": [],
-                "metadata": {
-                    "file_type": Path(filename or "").suffix.lower().lstrip(".") or "txt",
-                    "row_count": 0,
-                    "processed_at": processed_at,
-                },
-            }
         data, meta, st = _process_unstructured(file_bytes, filename, api_key)
     else:
         data, meta, st = _process_structured_csv(file_bytes, filename, api_key)
@@ -367,21 +390,30 @@ def process_universal(
     mark_amount_outliers(data)
 
     if not data:
-        st = "failed" if st == "failed" else "partial"
+        from core.fallback_extractor import fallback_extract
+
+        logger.warning("Empty data after processing; injecting fallback placeholder")
+        data = fallback_extract("")
+        st = "partial"
+
+    final_status = st
+    if final_status == "failed" and data:
+        final_status = "partial"
 
     envelope: dict[str, Any] = {
         "document_id": document_id,
         "document_type": str(meta.get("document_type", "auto")),
-        "status": st,
+        "status": final_status,
         "data": data,
+        "error": meta.get("error"),
         "metadata": {
             "file_type": meta.get("file_type", "unknown"),
             "row_count": len(data),
             "processed_at": processed_at,
         },
     }
-    if meta.get("error"):
-        envelope["error"] = meta["error"]
+    if meta.get("extraction"):
+        envelope["metadata"]["extraction"] = meta["extraction"]
     if output_format == "table":
         envelope["table"] = to_table(data)
 

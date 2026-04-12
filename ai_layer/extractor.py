@@ -1,10 +1,67 @@
 import json
+import logging
+import time
+from typing import Any, Dict
+
 from google import genai
 from pydantic import BaseModel, Field
-from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
+
 
 class AIServiceError(Exception):
     pass
+
+
+def _is_retryable_transport_error(exc: BaseException) -> bool:
+    """True for 429 / 503 style failures that may succeed after backoff."""
+    codes: set[int] = set()
+    seen: list[BaseException] = []
+    e: BaseException | None = exc
+    while e is not None and e not in seen:
+        seen.append(e)
+        code = getattr(e, "status_code", None)
+        if isinstance(code, int):
+            codes.add(code)
+        code = getattr(e, "code", None)
+        if isinstance(code, int):
+            codes.add(code)
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            sc = getattr(resp, "status_code", None)
+            if isinstance(sc, int):
+                codes.add(sc)
+        e = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+
+    if codes & {429, 503}:
+        return True
+
+    msg = str(exc).upper()
+    if "429" in msg or "503" in msg:
+        return True
+    if "RESOURCE_EXHAUSTED" in msg or "UNAVAILABLE" in msg or "RATE LIMIT" in msg:
+        return True
+
+    try:
+        from google.api_core import exceptions as gexc
+
+        if isinstance(
+            exc,
+            (
+                gexc.ResourceExhausted,
+                gexc.TooManyRequests,
+                gexc.ServiceUnavailable,
+            ),
+        ):
+            return True
+    except ImportError:
+        pass
+
+    return False
+
+
+# Public alias for other AI callers (e.g. schema detection) that share retry policy.
+is_retryable_api_error = _is_retryable_transport_error
 
 # ── Pydantic Schemas ──────────────────────────────────────────────────────────
 
@@ -174,40 +231,59 @@ def remove_additional_properties(schema):
 # ── Main Extractor ────────────────────────────────────────────────────────────
 
 def extract_entities(text: str, api_key: str, document_type: str = "unknown") -> dict:
-    try:
-        from google.genai import types
-        client = genai.Client(api_key=api_key)
+    from google.genai import types
 
-        # Select prompt from registry, fall back to unknown
-        prompt_template = PROMPTS.get(document_type, PROMPTS["unknown"])
-        prompt = prompt_template.format(text=text)
+    client = genai.Client(api_key=api_key)
 
-        # Generate JSON schema and sanitize it
-        schema_dict = DocumentExtraction.model_json_schema()
-        clean_schema = remove_additional_properties(schema_dict)
+    prompt_template = PROMPTS.get(document_type, PROMPTS["unknown"])
+    prompt = prompt_template.format(text=text)
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                response_mime_type="application/json",
-                response_schema=clean_schema
-            )
-        )
+    schema_dict = DocumentExtraction.model_json_schema()
+    clean_schema = remove_additional_properties(schema_dict)
 
-        raw = getattr(response, "text", None) or ""
-        if not str(raw).strip():
-            raise AIServiceError("Empty response from AI model.")
+    backoffs = (1, 2, 4)
+    max_retries = 3
+    last_error: BaseException | None = None
+    response = None
 
+    for attempt in range(max_retries + 1):
         try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            raise AIServiceError(f"Invalid JSON from AI:\n{raw[:300]}")
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                    response_schema=clean_schema,
+                ),
+            )
+            break
+        except AIServiceError:
+            raise
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries and _is_retryable_transport_error(e):
+                wait_s = backoffs[attempt]
+                logger.warning(
+                    "Retrying AI call (attempt %s)... after %ss | %s",
+                    attempt + 1,
+                    wait_s,
+                    e,
+                )
+                time.sleep(wait_s)
+                continue
+            raise AIServiceError(f"AI service failed: {e}") from e
 
-        return parsed
+    if response is None and last_error is not None:
+        raise AIServiceError(f"AI service failed after retries: {last_error}") from last_error
 
-    except AIServiceError:
-        raise
-    except Exception as e:
-        raise AIServiceError(f"AI service failed: {e}") from e
+    raw = getattr(response, "text", None) or ""
+    if not str(raw).strip():
+        raise AIServiceError("Empty response from AI model.")
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise AIServiceError(f"Invalid JSON from AI:\n{raw[:300]}") from e
+
+    return parsed

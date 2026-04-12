@@ -8,7 +8,6 @@ from fastapi.responses import PlainTextResponse, Response
 from db.crud import get_document, DBError
 from post_processor.processor import convert_to_toml
 
-from core.file_router import route_file as classify_upload
 from core.output_formatter import to_csv_file
 from core.universal_pipeline import process_universal
 
@@ -59,12 +58,6 @@ async def translate(
     if len(content) == 0:
         raise HTTPException(status_code=422,
             detail="File is empty.")
-
-    if classify_upload(file.filename or "") == "unstructured" and not os.getenv("GEMINI_API_KEY"):
-        raise HTTPException(
-            status_code=500,
-            detail="Server configuration error: GEMINI_API_KEY is required for TXT/PDF.",
-        )
 
     try:
         envelope = await asyncio.to_thread(
