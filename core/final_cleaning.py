@@ -893,7 +893,8 @@ def run_final_cleaning_layer(
         working = [_reorder_record_keys(r, [k for k in key_order if k != "__imputed__"]) for r in working]
 
     if cfg.clean_mode == "strict":
-        working = apply_true_final_cleaning(working)
+        critical_fields = infer_critical_fields(working)
+        working = dynamic_adaptive_cleaning(working, critical_fields)
 
     rows_out = len(working)
 
@@ -985,118 +986,111 @@ def write_cleaning_outputs(
     return {"validated": str(inter_path.resolve()), "final": str(final_path.resolve())}
 
 
-def text_to_int(text: str) -> int | None:
-    if not isinstance(text, str):
-        return None
-    t = text.lower().strip()
-    words = {
-        "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-        "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
-        "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
-        "nineteen": 19, "twenty": 20, "twenty one": 21, "twenty two": 22, 
-        "twenty three": 23, "twenty four": 24, "twenty five": 25,
-        "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, 
-        "eighty": 80, "ninety": 90
-    }
-    try:
-        return int(t)
-    except ValueError:
-        pass
-        
-    total = 0
-    current = 0
-    for word in t.replace("-", " ").split():
-        if word in words:
-            current += words[word]
-        elif word == "hundred":
-            current *= 100
-        elif word == "thousand":
-            total += current * 1000
-            current = 0
-    total += current
-    return total if total > 0 else None
+import collections
+import statistics
+from typing import Any
 
-def apply_true_final_cleaning(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Strictly enforces the exact target schema, dropping bad rows and imputing missing specific cols."""
+def dynamic_adaptive_cleaning(records: list[dict[str, Any]], critical_fields: list[str]) -> list[dict[str, Any]]:
+    """Fully dynamic cleaner: detects noise, infers types, imputes via median/mode, drops missing criticals."""
     if not records:
         return []
 
-    # 1. Pre-parse ages to find median
-    valid_ages = []
-    for r in records:
-        a = r.get("age")
-        if a is not None:
-            if isinstance(a, (int, float)) and a == a:
-                valid_ages.append(int(a))
-            elif isinstance(a, str):
-                v = text_to_int(a)
-                if v is not None:
-                    valid_ages.append(v)
-                    
-    median_age = 0
-    if valid_ages:
-        import statistics
-        median_age = int(statistics.median(valid_ages))
-        
-    cleaned = []
+    # 1. Strip validation noise
+    noise_prefixes = ("is_", "confidence")
+    noise_suffixes = ("_score",)
     
+    schema_keys = set()
     for r in records:
-        # CRITICAL FIELDS: Ensure presence and validity
-        # Email
-        email = r.get("email")
-        if not email or "@" not in str(email):
-            continue
-            
-        # Amount
-        amount = r.get("amount")
-        try:
-            if amount is None:
-                continue
-            amount_val = float(amount)
-        except (TypeError, ValueError):
-            continue
-            
-        # NON-CRITICAL IMPUTATION
-        # Age
-        age_in = r.get("age")
-        if age_in is not None:
-            if isinstance(age_in, (int, float)):
-                age_val = int(age_in)
-            else:
-                parsed = text_to_int(str(age_in))
-                age_val = parsed if parsed is not None else median_age
+        for k in r.keys():
+            k_lower = k.lower()
+            if not k_lower.startswith(noise_prefixes) and not k_lower.endswith(noise_suffixes):
+                if k != "__imputed__":
+                    schema_keys.add(k)
+                
+    schema_keys_list = sorted(list(schema_keys))
+    
+    # 2. Field profiling
+    numeric_fields = set()
+    categorical_fields = set()
+    
+    for k in schema_keys_list:
+        num_count = 0
+        total_count = 0
+        for r in records:
+            v = r.get(k)
+            if v is not None and str(v).strip() != "":
+                total_count += 1
+                try:
+                    float(v)
+                    num_count += 1
+                except (ValueError, TypeError):
+                    pass
+        if total_count > 0 and (num_count / total_count) > 0.8:
+            numeric_fields.add(k)
         else:
-            age_val = median_age
+            categorical_fields.add(k)
             
-        # Phone
-        phone_in = r.get("phone")
-        phone_val = "9999999999"
-        if phone_in:
-            digits = re.sub(r"\\D+", "", str(phone_in))
-            if len(digits) == 10:
-                phone_val = digits
-
-        # EXACT TARGET SCHEMA
-        # We drop all is_valid_*, is_anomaly, confidence flags
-        new_row = {
-            "id": r.get("id", ""),
-            "person_name": r.get("person_name", "Unknown"),
-            "age": age_val,
-            "email": str(email),
-            "phone": phone_val,
-            "city": r.get("city", "Unknown"),
-            "amount": amount_val
-        }
-        
-        # Guard clause to absolutely prevent null
-        if new_row["id"] is None:
-            new_row["id"] = ""
-        if new_row["person_name"] is None:
-            new_row["person_name"] = "Unknown"
-        if new_row["city"] is None:
-            new_row["city"] = "Unknown"
-             
+    # 3. Compute Medians and Modes
+    medians: dict[str, float] = {}
+    for nk in numeric_fields:
+        vals = []
+        for r in records:
+            v = r.get(nk)
+            if v is not None and str(v).strip() != "":
+                try:
+                    vals.append(float(v))
+                except: pass
+        if vals:
+            medians[nk] = statistics.median(vals)
+            
+    modes: dict[str, Any] = {}
+    for ck in categorical_fields:
+        counts = collections.Counter()
+        for r in records:
+            v = r.get(ck)
+            if v is not None and str(v).strip() != "":
+                counts[str(v).strip()] += 1
+        if counts:
+            modes[ck] = counts.most_common(1)[0][0]
+            
+    # 4. Row filtering and Imputation
+    cleaned = []
+    for r in records:
+        # CRITICAL FILTER
+        missing_critical = False
+        for cf in critical_fields:
+            if cf in r:
+                v = r.get(cf)
+                if v is None or str(v).strip() == "" or str(v).lower() in ("unknown", "error", "invalid"):
+                    missing_critical = True
+                    break
+        if missing_critical:
+            continue
+            
+        new_row = {}
+        for k in schema_keys_list:
+            v = r.get(k)
+            v_str = str(v).strip()
+            is_empty = (v is None or v_str == "" or v_str.lower() in ("unknown", "error", "invalid"))
+            
+            if k in numeric_fields:
+                if is_empty:
+                    new_row[k] = medians.get(k, 0.0)
+                else:
+                    try:
+                        new_row[k] = float(v)
+                    except:
+                        new_row[k] = medians.get(k, 0.0)
+            else:
+                if is_empty:
+                    new_row[k] = modes.get(k, "Unknown")
+                else:
+                    # standardize to proper case unless it's an email
+                    if "@" in v_str and "." in v_str:
+                        new_row[k] = v_str.lower()
+                    else:
+                        new_row[k] = v_str.title()
+                        
         cleaned.append(new_row)
         
     return cleaned
