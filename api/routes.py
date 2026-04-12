@@ -27,7 +27,11 @@ def _extension_from_filename(name: str | None) -> str | None:
 @router.post("/translate")
 async def translate(
     file: UploadFile = File(...),
-    fmt: str = Query("json", alias="format", description='Response shape: "json", "table", or "csv"'),
+    fmt: str = Query(
+        "json",
+        alias="format",
+        description='Response shape: "json", "table", "csv", or "dashboard"',
+    ),
 ):
     ext = _extension_from_filename(file.filename)
     if not ext or ext not in ALLOWED_EXTENSIONS:
@@ -39,10 +43,10 @@ async def translate(
             ),
         )
 
-    if fmt not in ("json", "table", "csv"):
+    if fmt not in ("json", "table", "csv", "dashboard"):
         raise HTTPException(
             status_code=422,
-            detail='Invalid format. Use format=json, format=table, or format=csv',
+            detail='Invalid format. Use format=json, table, csv, or dashboard',
         )
 
     content = b""

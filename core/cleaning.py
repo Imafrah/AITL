@@ -1,4 +1,4 @@
-"""Universal row cleaning — names, dates (ISO), amounts, invalid stripping, outliers."""
+"""Universal row cleaning — names, dates (ISO), amounts, contact fields, outliers."""
 
 from __future__ import annotations
 
@@ -7,6 +7,9 @@ from typing import Any
 
 from parsers.csv_parser import safe_float
 from post_processor.processor import parse_date
+
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+_PHONE_DIGITS_RE = re.compile(r"\D+")
 
 
 def clean_name(value: str | None) -> str | None:
@@ -17,6 +20,45 @@ def clean_name(value: str | None) -> str | None:
         return None
     t = re.sub(r"\s+", " ", t)
     return t[:512] or None
+
+
+def clean_email(value: str | None) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    return s[:320] or None
+
+
+def clean_phone(value: str | None) -> str | None:
+    if value is None:
+        return None
+    s = re.sub(r"\s+", " ", str(value).strip())
+    if not s:
+        return None
+    return s[:64] or None
+
+
+def normalize_city(value: str | None) -> str | None:
+    """Light normalization for city / location labels."""
+    base = clean_name(value)
+    if not base:
+        return None
+    return base.title()
+
+
+def is_valid_email(value: str | None) -> bool:
+    s = clean_email(value)
+    return bool(s and _EMAIL_RE.match(s))
+
+
+def is_valid_phone(value: str | None) -> bool:
+    s = clean_phone(value)
+    if not s:
+        return False
+    digits = _PHONE_DIGITS_RE.sub("", s)
+    return 10 <= len(digits) <= 15
 
 
 def normalize_date_value(value: Any) -> str | None:
@@ -38,6 +80,14 @@ def amount_from_value(value: Any) -> float | None:
             return None
         return float(value)
     return safe_float(str(value).strip())
+
+
+def is_valid_salary(value: Any) -> bool:
+    """True when numeric and in a plausible compensation range."""
+    a = amount_from_value(value)
+    if a is None:
+        return False
+    return 0.0 <= a <= 100_000_000.0
 
 
 def build_clean_row(

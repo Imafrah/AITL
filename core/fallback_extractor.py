@@ -93,6 +93,12 @@ def _empty_row(confidence: float = 0.35) -> dict[str, Any]:
         "date": None,
         "confidence": confidence,
         "is_outlier": False,
+        "name": None,
+        "email": None,
+        "phone": None,
+        "city": None,
+        "salary": None,
+        "is_anomaly": False,
     }
 
 
@@ -123,11 +129,17 @@ def fallback_extract(text: str) -> list[dict[str, Any]]:
         rows.append(
             {
                 "person_name": pn,
+                "name": pn,
                 "organization": None,
+                "city": None,
+                "email": None,
+                "phone": None,
                 "amount": amt,
+                "salary": amt,
                 "date": iso or (str(dt)[:32] if dt else None),
                 "confidence": 0.5,
                 "is_outlier": False,
+                "is_anomaly": False,
             }
         )
 

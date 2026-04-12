@@ -63,6 +63,7 @@ def get_schema_from_memory(columns: list[str]) -> dict[str, Any] | None:
             ).fetchone()
         if not row:
             return None
+        logger.info("⚡ Using cached schema | signature=%s", sig[:12])
         return json.loads(row["mapping"])
     except Exception as e:
         logger.warning("Schema memory read failed: %s", e)
@@ -87,6 +88,6 @@ def save_schema_to_memory(columns: list[str], mapping: dict[str, Any]) -> None:
                 (sig, body, now),
             )
             conn.commit()
-        logger.info("Schema saved to memory | signature=%s", sig[:12])
+        logger.info("💾 Schema saved | signature=%s", sig[:12])
     except Exception as e:
         logger.warning("Schema memory write failed: %s", e)

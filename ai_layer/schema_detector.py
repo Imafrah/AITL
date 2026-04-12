@@ -22,6 +22,9 @@ class SchemaMappingModel(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     person_name: list[str] = Field(default_factory=list)
+    email: list[str] = Field(default_factory=list)
+    phone: list[str] = Field(default_factory=list)
+    city: list[str] = Field(default_factory=list)
     organization: list[str] = Field(default_factory=list)
     date: list[str] = Field(default_factory=list)
     amount: list[str] = Field(default_factory=list)
@@ -73,9 +76,12 @@ Given these CSV rows as JSON (column names are exact — reuse them in mapping v
 
 Roles:
 - person_name: person or client name
+- email: email address column
+- phone: phone, mobile, fax column
+- city: city, town, postal/region if clearly geographic (not street address text)
 - organization: company, vendor, department, merchant, supplier
 - date: any date/datetime column
-- amount: money, price, cost, quantity-as-number if clearly monetary context
+- amount: money, price, cost, salary, quantity-as-number if clearly monetary context
 - currency: ISO or symbol column if separate from amount
 
 Rows:

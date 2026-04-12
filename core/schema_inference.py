@@ -1,23 +1,23 @@
 """
 Generic column → semantic role inference from header text only (no dataset-specific parsers).
-Works with dynamic_map_row + build_clean_row for any CSV shape.
+Works with dynamic_map_row + intelligence records for any CSV shape.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
-from core.cleaning import build_clean_row
-from parsers.csv_parser import dynamic_map_row, normalize_field_name, safe_float
-from post_processor.processor import parse_date
+from core.intelligence_record import heuristic_intelligence_row, mapped_intelligence_row
+from parsers.csv_parser import normalize_field_name
 
 logger = logging.getLogger(__name__)
 
 # Role match order: first match wins (put narrower / higher-signal roles first).
 _ROLE_PRIORITY: tuple[tuple[str, frozenset[str]], ...] = (
     ("currency", frozenset({"currency", "curr", "iso", "fx", "money_unit"})),
+    ("email", frozenset({"email", "e_mail", "mail", "mailbox"})),
+    ("phone", frozenset({"phone", "tel", "mobile", "cell", "fax", "whatsapp"})),
     (
         "amount",
         frozenset(
@@ -65,6 +65,22 @@ _ROLE_PRIORITY: tuple[tuple[str, frozenset[str]], ...] = (
                 "end",
                 "dob",
                 "birth",
+            }
+        ),
+    ),
+    (
+        "city",
+        frozenset(
+            {
+                "city",
+                "town",
+                "municipality",
+                "metro",
+                "region",
+                "state",
+                "province",
+                "zip",
+                "postal",
             }
         ),
     ),
@@ -153,39 +169,8 @@ def infer_mapping_from_columns(columns: list[str]) -> dict[str, list[str]]:
 
 
 def heuristic_row_without_mapping(row: dict[str, Any]) -> dict[str, Any]:
-    """
-    When no column mapping exists, scan cell values for a plausible name / amount / date.
-    """
-    texts: list[str] = []
-    nums: list[float] = []
-    dates: list[str] = []
-
-    for _k, v in row.items():
-        if v is None:
-            continue
-        s = str(v).strip()
-        if not s:
-            continue
-        iso = parse_date(s)
-        if iso:
-            dates.append(iso)
-            continue
-        n = safe_float(s)
-        if n is not None and n == n:
-            if n == int(n) and 1900 <= int(n) <= 2100 and len(re.sub(r"[^\d]", "", s)) <= 4:
-                continue
-            nums.append(float(n))
-            continue
-        if len(s) >= 2:
-            texts.append(s)
-
-    return build_clean_row(
-        texts[0] if texts else None,
-        None,
-        nums[0] if nums else None,
-        dates[0] if dates else None,
-        0.55,
-    )
+    """When no column mapping exists, preserve all fields and infer slots from values."""
+    return heuristic_intelligence_row(row)
 
 
 def mapping_to_universal_row(
@@ -195,21 +180,10 @@ def mapping_to_universal_row(
     confidence: float = 0.82,
     schema_source: str = "inferred",
 ) -> dict[str, Any]:
-    """Apply dynamic_map_row + universal cleaning (single code path for mapped CSV)."""
-    m = dynamic_map_row(row, mapping)
-    base_conf = confidence
-    if schema_source == "ai":
-        base_conf = max(base_conf, 0.86)
-    elif schema_source == "heuristic":
-        base_conf = min(base_conf, 0.78)
-
-    return build_clean_row(
-        m.get("person_name"),
-        m.get("organization"),
-        m.get("amount"),
-        m.get("date"),
-        base_conf,
-    )
+    """Map columns to semantic roles and merge with preserved fields."""
+    _ = confidence  # confidence derived inside mapped_intelligence_row from validations
+    src = schema_source if schema_source != "inferred" else "heuristic"
+    return mapped_intelligence_row(row, mapping, schema_source=src)
 
 
 def mapping_is_non_empty(mapping: dict[str, Any]) -> bool:

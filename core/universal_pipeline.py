@@ -11,8 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from core.cleaning import build_clean_row, mark_amount_outliers
+from core.analytics_engine import compute_analytics
+from core.anomaly_detector import apply_anomaly_detection
+from core.cleaning import build_clean_row, is_valid_email, is_valid_phone, is_valid_salary
+from core.dashboard_formatter import build_dashboard
 from core.file_router import route_file as classify_file
+from core.intelligence_record import coerce_intelligence_row, dedupe_intelligence_rows
 from core.output_formatter import to_table
 from core.schema_memory import get_schema_from_memory, save_schema_to_memory
 
@@ -193,7 +197,6 @@ def _process_structured_csv(
         mapping = dict(cached.get("mapping") or {})
         schema_type = str(cached.get("schema_type") or cached.get("handler") or "generic")
         schema_source = str(cached.get("source") or "memory")
-        logger.info("Schema memory hit | cols=%s | mapped_roles=%s", len(columns), bool(mapping))
 
     if not memory_hit:
         mapping = infer_mapping_from_columns(columns)
@@ -243,7 +246,7 @@ def _process_structured_csv(
         except Exception as ex:
             logger.exception("CSV row error: %s", ex)
             status = "partial"
-            data_rows.append(build_clean_row(None, None, None, None, 0.2))
+            data_rows.append(coerce_intelligence_row({"confidence": 0.2}))
 
     if not data_rows and status == "success":
         status = "partial"
@@ -361,8 +364,9 @@ def process_universal(
     api_key: str | None,
 ) -> dict[str, Any]:
     """
-    Main entry: returns universal envelope. ``output_format`` in json | table | csv
-    (csv only affects optional table blob; route may return raw bytes for csv).
+    Main entry: returns universal envelope.
+    ``output_format``: json | table | csv | dashboard
+    (csv returns raw bytes from the route; dashboard adds summary + charts + sample rows).
     """
     kind = classify_file(filename or "")
     document_id = str(uuid.uuid4())
@@ -379,6 +383,12 @@ def process_universal(
                 "file_type": "unknown",
                 "row_count": 0,
                 "processed_at": processed_at,
+                "analytics": compute_analytics([]),
+                "validation": {
+                    "valid_email_count": 0,
+                    "valid_phone_count": 0,
+                    "valid_salary_count": 0,
+                },
             },
         }
 
@@ -387,14 +397,29 @@ def process_universal(
     else:
         data, meta, st = _process_structured_csv(file_bytes, filename, api_key)
 
-    mark_amount_outliers(data)
+    data = [coerce_intelligence_row(r) for r in data]
+    data = dedupe_intelligence_rows(data)
+    apply_anomaly_detection(data)
+    analytics = compute_analytics(data)
+    validation_summary = {
+        "valid_email_count": sum(1 for r in data if is_valid_email(r.get("email"))),
+        "valid_phone_count": sum(1 for r in data if is_valid_phone(r.get("phone"))),
+        "valid_salary_count": sum(1 for r in data if is_valid_salary(r.get("salary"))),
+    }
 
     if not data:
         from core.fallback_extractor import fallback_extract
 
         logger.warning("Empty data after processing; injecting fallback placeholder")
-        data = fallback_extract("")
+        data = [coerce_intelligence_row(r) for r in fallback_extract("")]
         st = "partial"
+        apply_anomaly_detection(data)
+        analytics = compute_analytics(data)
+        validation_summary = {
+            "valid_email_count": sum(1 for r in data if is_valid_email(r.get("email"))),
+            "valid_phone_count": sum(1 for r in data if is_valid_phone(r.get("phone"))),
+            "valid_salary_count": sum(1 for r in data if is_valid_salary(r.get("salary"))),
+        }
 
     final_status = st
     if final_status == "failed" and data:
@@ -410,12 +435,16 @@ def process_universal(
             "file_type": meta.get("file_type", "unknown"),
             "row_count": len(data),
             "processed_at": processed_at,
+            "analytics": analytics,
+            "validation": validation_summary,
         },
     }
     if meta.get("extraction"):
         envelope["metadata"]["extraction"] = meta["extraction"]
     if output_format == "table":
         envelope["table"] = to_table(data)
+    elif output_format == "dashboard":
+        envelope["dashboard"] = build_dashboard(data, analytics)
 
     # Persist universal envelope (best-effort)
     try:

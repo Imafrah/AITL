@@ -74,6 +74,7 @@ export default function App() {
           >
             <option value="json">JSON (full envelope)</option>
             <option value="table">JSON + flattened table</option>
+            <option value="dashboard">JSON + dashboard (analytics)</option>
             <option value="csv">Download CSV</option>
           </select>
         </div>
@@ -119,6 +120,28 @@ export default function App() {
             <>
               <h2 style={styles.sectionTitle}>Flattened table</h2>
               <DataPreview rows={result.table} />
+            </>
+          )}
+
+          {result.dashboard && (
+            <>
+              <h2 style={styles.sectionTitle}>Dashboard</h2>
+              <div style={styles.metaBox}>
+                <h3 style={{ ...styles.sectionTitle, marginTop: 0 }}>Summary</h3>
+                <pre style={styles.jsonBox}>
+                  {JSON.stringify(result.dashboard.summary || {}, null, 2)}
+                </pre>
+                <h3 style={styles.sectionTitle}>Salary stats</h3>
+                <pre style={styles.jsonBox}>
+                  {JSON.stringify(result.dashboard.charts?.salary_stats || {}, null, 2)}
+                </pre>
+                <h3 style={styles.sectionTitle}>City distribution (top)</h3>
+                <pre style={styles.jsonBox}>
+                  {JSON.stringify(result.dashboard.charts?.city_distribution || {}, null, 2)}
+                </pre>
+                <h3 style={styles.sectionTitle}>Sample records</h3>
+                <DataPreview rows={result.dashboard.records || []} />
+              </div>
             </>
           )}
 
