@@ -25,6 +25,14 @@ logger = logging.getLogger(__name__)
 MAX_CSV_ROWS = int(__import__("os").getenv("AITL_MAX_CSV_ROWS", "100000"))
 
 
+def _infer_dataset_type_from_document(document_type: str) -> str:
+    t = (document_type or "").lower()
+    for k in ("invoice", "employee", "transaction", "sales"):
+        if k in t:
+            return k
+    return "generic"
+
+
 def structured_doc_to_row(doc: dict[str, Any]) -> dict[str, Any]:
     """One legacy structured document → one universal row."""
     e = doc.get("entities") or {}
@@ -133,16 +141,6 @@ def entities_to_universal_rows(entities: dict[str, Any]) -> list[dict[str, Any]]
     return out
 
 
-def _mapping_covers_few_roles(mapping: dict[str, Any]) -> bool:
-    """True when we should still try AI (heuristic too thin)."""
-    from core.schema_inference import mapping_is_non_empty
-
-    if not mapping_is_non_empty(mapping):
-        return True
-    filled = sum(1 for v in mapping.values() if v)
-    return filled < 2
-
-
 def _csv_cache_is_usable(cached: dict[str, Any]) -> bool:
     """Trust cache when it has a modern envelope or an explicit mapping dict (incl. empty)."""
     if "source" in cached:
@@ -155,11 +153,13 @@ def _process_structured_csv(
     filename: str,
     api_key: str | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
-    from core.schema_inference import (
-        heuristic_row_without_mapping,
-        infer_mapping_from_columns,
-        mapping_is_non_empty,
-        mapping_to_universal_row,
+    from core.intelligence_record import heuristic_intelligence_row, semantic_intelligence_row
+    from core.semantic_mapping import (
+        classify_fields,
+        detect_dataset_type,
+        field_map_needs_ai,
+        field_map_nonempty,
+        merge_field_maps,
     )
     from parsers.csv_parser import clean_csv_row
     from parsers.csv_robust import parse_csv_text_to_rows
@@ -180,40 +180,46 @@ def _process_structured_csv(
             break
 
     memory_hit = False
-    mapping: dict[str, Any] = {}
-    schema_type = "generic"
+    base_fm = classify_fields(columns)
+    dataset_type = detect_dataset_type(columns)
+    field_map: dict[str, list[str]] = {k: list(v) for k, v in base_fm.items() if v}
     schema_source = "heuristic"
 
     if cached and _csv_cache_is_usable(cached):
         memory_hit = True
-        mapping = dict(cached.get("mapping") or {})
-        schema_type = str(cached.get("schema_type") or cached.get("handler") or "generic")
+        field_map = merge_field_maps(
+            base_fm,
+            cached.get("field_map") or cached.get("mapping"),
+        )
+        field_map = {k: v for k, v in field_map.items() if v}
+        dataset_type = str(
+            cached.get("dataset_type") or cached.get("schema_type") or dataset_type
+        )
         schema_source = str(cached.get("source") or "memory")
 
     if not memory_hit:
-        mapping = infer_mapping_from_columns(columns)
-        schema_type = str(
-            (cached or {}).get("schema_type") or (cached or {}).get("handler") or "generic"
-        )
-        schema_source = "heuristic"
-
-        if _mapping_covers_few_roles(mapping) and sample and api_key and str(api_key).strip():
+        if field_map_needs_ai(field_map) and sample and api_key and str(api_key).strip():
             try:
                 from ai_layer.schema_detector import detect_schema_ai
 
                 ai = detect_schema_ai(sample, api_key)
                 ai_m = ai.get("mapping") or {}
-                if mapping_is_non_empty(ai_m):
-                    mapping = ai_m
-                    schema_type = str(ai.get("schema_type") or schema_type)
+                merged = merge_field_maps(field_map, ai_m)
+                if field_map_nonempty(merged):
+                    field_map = {k: v for k, v in merged.items() if v}
+                    st = str(ai.get("schema_type", "")).lower()
+                    if st in ("employee", "invoice", "transaction", "sales", "generic"):
+                        dataset_type = st
                     schema_source = "ai"
-                    logger.info("Schema from AI | type=%s", schema_type)
+                    logger.info("Schema from AI | type=%s", dataset_type)
             except Exception as ex:
                 logger.warning("AI schema detection failed: %s", ex)
 
         payload = {
-            "mapping": mapping,
-            "schema_type": schema_type,
+            "field_map": field_map,
+            "mapping": field_map,
+            "dataset_type": dataset_type,
+            "schema_type": dataset_type,
             "source": schema_source,
         }
         save_schema_to_memory(columns, payload)
@@ -229,12 +235,17 @@ def _process_structured_csv(
             continue
         row = clean_csv_row(dict(raw_row))
         try:
-            if mapping_is_non_empty(mapping):
+            if field_map_nonempty(field_map):
                 data_rows.append(
-                    mapping_to_universal_row(row, mapping, schema_source=schema_source)
+                    semantic_intelligence_row(
+                        row,
+                        field_map,
+                        dataset_type,
+                        schema_source=schema_source,
+                    )
                 )
             else:
-                data_rows.append(heuristic_row_without_mapping(row))
+                data_rows.append(heuristic_intelligence_row(row))
         except Exception as ex:
             logger.exception("CSV row error: %s", ex)
             status = "partial"
@@ -245,7 +256,8 @@ def _process_structured_csv(
 
     meta = {
         "file_type": "csv",
-        "document_type": schema_type,
+        "document_type": dataset_type,
+        "dataset_type": dataset_type,
         "column_count": len(columns),
         "schema_source": schema_source,
         "from_cache": memory_hit,
@@ -380,6 +392,8 @@ def process_universal(
                     "valid_email_count": 0,
                     "valid_phone_count": 0,
                     "valid_salary_count": 0,
+                    "valid_date_count": 0,
+                    "valid_numeric_count": 0,
                 },
             },
         }
@@ -389,14 +403,25 @@ def process_universal(
     else:
         data, meta, st = _process_structured_csv(file_bytes, filename, api_key)
 
+    if meta.get("dataset_type") is None:
+        meta["dataset_type"] = _infer_dataset_type_from_document(
+            str(meta.get("document_type", ""))
+        )
+
+    dataset_type = str(meta.get("dataset_type") or "generic")
+
     data = [coerce_intelligence_row(r) for r in data]
     data = dedupe_intelligence_rows(data)
-    apply_anomaly_detection(data)
-    analytics = compute_analytics(data)
+    apply_anomaly_detection(data, dataset_type=dataset_type)
+    analytics = compute_analytics(data, dataset_type=dataset_type)
     validation_summary = {
         "valid_email_count": sum(1 for r in data if is_valid_email(r.get("email"))),
         "valid_phone_count": sum(1 for r in data if is_valid_phone(r.get("phone"))),
-        "valid_salary_count": sum(1 for r in data if is_valid_salary(r.get("salary"))),
+        "valid_salary_count": sum(
+            1 for r in data if is_valid_salary(r.get("salary") or r.get("amount"))
+        ),
+        "valid_date_count": sum(1 for r in data if r.get("is_valid_date")),
+        "valid_numeric_count": sum(1 for r in data if r.get("is_valid_numeric")),
     }
 
     if not data:
@@ -405,12 +430,16 @@ def process_universal(
         logger.warning("Empty data after processing; injecting fallback placeholder")
         data = [coerce_intelligence_row(r) for r in fallback_extract("")]
         st = "partial"
-        apply_anomaly_detection(data)
-        analytics = compute_analytics(data)
+        apply_anomaly_detection(data, dataset_type=dataset_type)
+        analytics = compute_analytics(data, dataset_type=dataset_type)
         validation_summary = {
             "valid_email_count": sum(1 for r in data if is_valid_email(r.get("email"))),
             "valid_phone_count": sum(1 for r in data if is_valid_phone(r.get("phone"))),
-            "valid_salary_count": sum(1 for r in data if is_valid_salary(r.get("salary"))),
+            "valid_salary_count": sum(
+                1 for r in data if is_valid_salary(r.get("salary") or r.get("amount"))
+            ),
+            "valid_date_count": sum(1 for r in data if r.get("is_valid_date")),
+            "valid_numeric_count": sum(1 for r in data if r.get("is_valid_numeric")),
         }
 
     final_status = st

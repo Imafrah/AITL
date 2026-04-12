@@ -40,12 +40,36 @@ def clean_phone(value: str | None) -> str | None:
     return s[:64] or None
 
 
+_CITY_ALIASES: dict[str, str] = {
+    "bengaluru": "Bangalore",
+    "bangalore": "Bangalore",
+    "gurgaon": "Gurugram",
+    "gurugram": "Gurugram",
+    "bombay": "Mumbai",
+    "calcutta": "Kolkata",
+}
+
+
 def normalize_city(value: str | None) -> str | None:
-    """Light normalization for city / location labels."""
+    """Light normalization for city / location labels (title case + common aliases)."""
     base = clean_name(value)
     if not base:
         return None
+    key = base.strip().lower()
+    if key in _CITY_ALIASES:
+        return _CITY_ALIASES[key]
     return base.title()
+
+
+def normalize_status_value(value: str | None) -> str | None:
+    """Human-readable status: e.g. paid → Paid, in_progress → In Progress."""
+    s = clean_name(value)
+    if not s:
+        return None
+    if re.search(r"[_\s-]", s):
+        parts = re.split(r"[_\s-]+", s)
+        return " ".join(p.capitalize() for p in parts if p)[:256] or None
+    return s.capitalize()[:256]
 
 
 def is_valid_email(value: str | None) -> bool:
@@ -80,6 +104,20 @@ def amount_from_value(value: Any) -> float | None:
             return None
         return float(value)
     return safe_float(str(value).strip())
+
+
+def is_valid_date(value: Any) -> bool:
+    return normalize_date_value(value) is not None
+
+
+def is_valid_numeric(value: Any) -> bool:
+    """True if value parses to a finite float (empty / None → False)."""
+    if value is None:
+        return False
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value == value
+    a = amount_from_value(value)
+    return a is not None and a == a
 
 
 def is_valid_salary(value: Any) -> bool:

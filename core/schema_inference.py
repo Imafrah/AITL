@@ -179,11 +179,14 @@ def mapping_to_universal_row(
     *,
     confidence: float = 0.82,
     schema_source: str = "inferred",
+    dataset_type: str = "generic",
 ) -> dict[str, Any]:
     """Map columns to semantic roles and merge with preserved fields."""
     _ = confidence  # confidence derived inside mapped_intelligence_row from validations
     src = schema_source if schema_source != "inferred" else "heuristic"
-    return mapped_intelligence_row(row, mapping, schema_source=src)
+    return mapped_intelligence_row(
+        row, mapping, schema_source=src, dataset_type=dataset_type
+    )
 
 
 def mapping_is_non_empty(mapping: dict[str, Any]) -> bool:

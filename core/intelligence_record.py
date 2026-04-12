@@ -1,6 +1,5 @@
 """
-Row model for the universal intelligence engine: preserve all CSV fields (normalized keys),
-canonical slots (name, email, phone, city, salary), confidence, and anomaly flag.
+Intelligence rows: semantic slots (context-aware), sparse output, preserved unmapped columns.
 """
 
 from __future__ import annotations
@@ -13,13 +12,20 @@ from core.cleaning import (
     clean_email,
     clean_name,
     clean_phone,
+    is_valid_date,
     is_valid_email,
+    is_valid_numeric,
     is_valid_phone,
     normalize_city,
     normalize_date_value,
+    normalize_status_value,
 )
-from parsers.csv_parser import dynamic_map_row, normalize_field_name, safe_float
-from post_processor.processor import parse_date
+from core.semantic_mapping import (
+    classify_fields,
+    detect_dataset_type,
+    dynamic_semantic_map,
+)
+from parsers.csv_parser import normalize_field_name
 
 _LEGACY_KEYS = frozenset({"person_name", "organization", "amount", "is_outlier"})
 
@@ -45,6 +51,17 @@ def _smart_clean_cell(norm_key: str, value: Any) -> Any:
     if any(
         x in nk
         for x in (
+            "quantity",
+            "qty",
+            "units",
+            "items",
+        )
+    ):
+        n = amount_from_value(value)
+        return n
+    if any(
+        x in nk
+        for x in (
             "salary",
             "amount",
             "price",
@@ -66,7 +83,7 @@ def _smart_clean_cell(norm_key: str, value: Any) -> Any:
 
 
 def preserve_csv_row(row: dict[str, Any]) -> dict[str, Any]:
-    """All columns → normalized snake_case keys with light type-aware cleaning (no drops)."""
+    """All columns → normalized snake_case keys with light type-aware cleaning."""
     out: dict[str, Any] = {}
     for k, v in row.items():
         nk = normalize_field_name(str(k))
@@ -76,7 +93,50 @@ def preserve_csv_row(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _confidence_for_record(
+def _quantity_parsed(raw: Any) -> float | int | None:
+    if raw is None:
+        return None
+    n = amount_from_value(raw)
+    if n is None:
+        return None
+    if n == int(n) and abs(n) < 1e12:
+        return int(n)
+    return float(n)
+
+
+def _resolve_output_amount(
+    sem: dict[str, Any],
+    dataset_type: str,
+    field_map: dict[str, list[str]],
+) -> tuple[float | None, Any]:
+    """Choose monetary amount without ever using quantity. Employee prefers salary_comp."""
+    dt = (dataset_type or "generic").lower()
+    raw_sal = sem.get("salary_comp")
+    raw_amt = sem.get("amount_monetary")
+
+    if dt == "employee" and field_map.get("salary_comp") and raw_sal is not None:
+        v = amount_from_value(raw_sal)
+        if v is not None:
+            return v, raw_sal
+
+    if raw_amt is not None:
+        v = amount_from_value(raw_amt)
+        if v is not None:
+            return v, raw_amt
+
+    if dt != "employee" and raw_sal is not None:
+        v = amount_from_value(raw_sal)
+        if v is not None:
+            return v, raw_sal
+
+    if raw_sal is not None:
+        v = amount_from_value(raw_sal)
+        return v, raw_sal
+
+    return None, None
+
+
+def _confidence_for_semantic_record(
     rec: dict[str, Any],
     *,
     schema_source: str,
@@ -84,7 +144,8 @@ def _confidence_for_record(
     base = {"memory": 0.96, "ai": 0.9, "heuristic": 0.82, "migrated": 0.84}.get(
         schema_source, 0.85
     )
-    if rec.get("name") and not is_valid_email(rec.get("email")) and rec.get("email"):
+    pn = rec.get("person_name") or rec.get("name")
+    if pn and rec.get("email") and not is_valid_email(rec.get("email")):
         base -= 0.06
     if rec.get("email") and is_valid_email(rec.get("email")):
         base = min(1.0, base + 0.02)
@@ -92,9 +153,91 @@ def _confidence_for_record(
         base -= 0.04
     if rec.get("phone") and is_valid_phone(rec.get("phone")):
         base = min(1.0, base + 0.01)
-    if not (rec.get("name") or rec.get("email") or rec.get("phone")):
+    if not (pn or rec.get("email") or rec.get("phone")):
         base -= 0.12
     return max(0.0, min(1.0, base))
+
+
+def semantic_intelligence_row(
+    row: dict[str, Any],
+    field_map: dict[str, list[str]],
+    dataset_type: str,
+    *,
+    schema_source: str = "heuristic",
+) -> dict[str, Any]:
+    """Map row through field_map; sparse canonical fields + preserved extras + validation flags."""
+    sem = dynamic_semantic_map(row, field_map)
+    preserved = preserve_csv_row(row)
+
+    used_norms = {normalize_field_name(str(c)) for cols in field_map.values() for c in cols}
+
+    person_name = clean_name(sem.get("person_name"))
+    email = clean_email(sem.get("email"))
+    phone = clean_phone(sem.get("phone"))
+    location = normalize_city(sem.get("location"))
+    status = normalize_status_value(sem.get("status"))
+
+    qty_raw = sem.get("quantity")
+    quantity = _quantity_parsed(qty_raw)
+
+    amount, amt_raw = _resolve_output_amount(sem, dataset_type, field_map)
+
+    date_raw = sem.get("date")
+    date_val = normalize_date_value(date_raw)
+
+    rec: dict[str, Any] = {}
+
+    if person_name:
+        rec["person_name"] = person_name
+    if email:
+        rec["email"] = email
+    if phone:
+        rec["phone"] = phone
+    if quantity is not None:
+        rec["quantity"] = quantity
+    if amount is not None:
+        rec["amount"] = amount
+    if date_val:
+        rec["date"] = date_val
+    if status:
+        rec["status"] = status
+    if location:
+        rec["location"] = location
+        rec["city"] = location
+
+    if person_name:
+        rec["name"] = person_name
+
+    if (dataset_type or "").lower() == "employee" and amount is not None:
+        rec["salary"] = amount
+
+    # Validation flags
+    rec["is_valid_email"] = bool(email and is_valid_email(email))
+    if date_raw is not None and str(date_raw).strip():
+        rec["is_valid_date"] = is_valid_date(date_raw)
+    else:
+        rec["is_valid_date"] = True
+    has_qty_role = bool(field_map.get("quantity"))
+    has_amt_role = bool(field_map.get("amount_monetary") or field_map.get("salary_comp"))
+    qty_ok = True
+    if has_qty_role and qty_raw is not None and str(qty_raw).strip():
+        qty_ok = is_valid_numeric(qty_raw)
+    amt_ok = True
+    if has_amt_role and amt_raw is not None and str(amt_raw).strip():
+        amt_ok = is_valid_numeric(amt_raw)
+    rec["is_valid_numeric"] = qty_ok and amt_ok
+
+    rec["confidence"] = _confidence_for_semantic_record(rec, schema_source=schema_source)
+    rec["is_anomaly"] = False
+
+    for nk, v in preserved.items():
+        if nk in used_norms:
+            continue
+        if nk in rec:
+            continue
+        rec[nk] = v
+
+    return rec
 
 
 def mapped_intelligence_row(
@@ -102,109 +245,92 @@ def mapped_intelligence_row(
     mapping: dict[str, Any],
     *,
     schema_source: str = "heuristic",
+    dataset_type: str = "generic",
 ) -> dict[str, Any]:
-    preserved = preserve_csv_row(row)
-    m = dynamic_map_row(row, mapping)
-
-    name = clean_name(m.get("person_name")) or clean_name(preserved.get("name"))
-    email = clean_email(m.get("email")) or clean_email(preserved.get("email"))
-    phone = clean_phone(m.get("phone")) or clean_phone(preserved.get("phone"))
-    city = (
-        normalize_city(m.get("city"))
-        or normalize_city(m.get("organization"))
-        or normalize_city(preserved.get("city"))
-        or normalize_city(preserved.get("organization"))
-    )
-    salary = amount_from_value(m.get("amount"))
-    if salary is None:
-        salary = amount_from_value(preserved.get("salary"))
-    if salary is None:
-        salary = amount_from_value(preserved.get("amount"))
-
-    out = {**preserved}
-    out["name"] = name
-    out["email"] = email
-    out["phone"] = phone
-    out["city"] = city
-    out["salary"] = salary
-    dv = m.get("date")
-    if dv not in (None, ""):
-        iso = normalize_date_value(dv)
-        if iso:
-            out["date"] = iso
-        elif "date" not in out or out.get("date") is None:
-            out["date"] = str(dv).strip()[:32] or None
-    out["confidence"] = _confidence_for_record(out, schema_source=schema_source)
-    out["is_anomaly"] = False
-    return out
+    """Backward-compatible entry when caller has a merged field_map (same as semantic)."""
+    fm = {k: (v if isinstance(v, list) else [v]) for k, v in mapping.items() if v}
+    return semantic_intelligence_row(row, fm, dataset_type, schema_source=schema_source)
 
 
 def heuristic_intelligence_row(row: dict[str, Any]) -> dict[str, Any]:
-    preserved = preserve_csv_row(row)
-    texts: list[str] = []
-    nums: list[float] = []
-    dates: list[str] = []
-
-    for _k, v in row.items():
-        if v is None:
-            continue
-        s = str(v).strip()
-        if not s:
-            continue
-        iso = parse_date(s)
-        if iso:
-            dates.append(iso)
-            continue
-        n = safe_float(s)
-        if n is not None and n == n:
-            if n == int(n) and 1900 <= int(n) <= 2100 and len(re.sub(r"[^\d]", "", s)) <= 4:
-                continue
-            nums.append(float(n))
-            continue
-        if len(s) >= 2:
-            texts.append(s)
-
-    name = clean_name(preserved.get("name")) or clean_name(texts[0] if texts else None)
-    email = clean_email(preserved.get("email"))
-    phone = clean_phone(preserved.get("phone"))
-    city = normalize_city(preserved.get("city"))
-    salary = amount_from_value(preserved.get("salary")) or (
-        nums[0] if nums else amount_from_value(preserved.get("amount"))
-    )
-
-    out = {**preserved}
-    out["name"] = name
-    out["email"] = email
-    out["phone"] = phone
-    out["city"] = city
-    out["salary"] = salary
-    if dates and not out.get("date"):
-        out["date"] = dates[0]
-    out["confidence"] = _confidence_for_record(out, schema_source="heuristic")
-    out["is_anomaly"] = False
-    return out
+    keys = [k for k in row.keys() if k is not None]
+    dt = detect_dataset_type([str(k) for k in keys])
+    fm = classify_fields([str(k) for k in keys])
+    return semantic_intelligence_row(row, fm, dt, schema_source="heuristic")
 
 
 def coerce_intelligence_row(d: dict[str, Any]) -> dict[str, Any]:
-    """Normalize legacy or partial rows into the intelligence shape; keep extra keys."""
+    """Normalize legacy / unstructured rows into the semantic shape."""
     out: dict[str, Any] = {}
     for k, v in d.items():
         if k in _LEGACY_KEYS:
             continue
+        if k in (
+            "is_valid_email",
+            "is_valid_date",
+            "is_valid_numeric",
+            "confidence",
+            "is_anomaly",
+        ):
+            continue
         out[k] = v
 
-    out["name"] = clean_name(d.get("name") or d.get("person_name"))
-    out["email"] = clean_email(d.get("email"))
-    out["phone"] = clean_phone(d.get("phone"))
-    out["city"] = normalize_city(d.get("city") or d.get("organization"))
-    out["salary"] = amount_from_value(
-        d.get("salary") if d.get("salary") is not None else d.get("amount")
-    )
+    pn = clean_name(d.get("person_name") or d.get("name"))
+    if pn:
+        out["person_name"] = pn
+        out["name"] = pn
+    elif d.get("person_name") is None and d.get("name") is None:
+        out.pop("person_name", None)
+        out.pop("name", None)
+
+    em = clean_email(d.get("email"))
+    if em:
+        out["email"] = em
+
+    ph = clean_phone(d.get("phone"))
+    if ph:
+        out["phone"] = ph
+
+    loc = normalize_city(d.get("location") or d.get("city") or d.get("organization"))
+    if loc:
+        out["location"] = loc
+        out["city"] = loc
+
+    amt = amount_from_value(d.get("amount"))
+    if amt is None:
+        amt = amount_from_value(d.get("salary"))
+    if amt is not None:
+        out["amount"] = amt
+
+    q = _quantity_parsed(d.get("quantity"))
+    if q is not None:
+        out["quantity"] = q
+
+    st = normalize_status_value(d.get("status"))
+    if st:
+        out["status"] = st
+
     iso = normalize_date_value(d.get("date"))
     if iso:
         out["date"] = iso
     elif d.get("date") is not None and str(d.get("date")).strip():
         out["date"] = str(d.get("date")).strip()[:32]
+
+    out["is_valid_email"] = bool(out.get("email") and is_valid_email(out.get("email")))
+    if out.get("date"):
+        out["is_valid_date"] = is_valid_date(out.get("date"))
+    else:
+        out["is_valid_date"] = True
+    amt_ok = True
+    if d.get("amount") is not None or d.get("salary") is not None:
+        amt_ok = is_valid_numeric(
+            d.get("amount") if d.get("amount") is not None else d.get("salary")
+        )
+    qty_ok = True
+    if d.get("quantity") is not None:
+        qty_ok = is_valid_numeric(d.get("quantity"))
+    out["is_valid_numeric"] = amt_ok and qty_ok
+
     out["confidence"] = max(0.0, min(1.0, float(d.get("confidence", 0.75))))
     out["is_anomaly"] = bool(d.get("is_anomaly", d.get("is_outlier", False)))
     return out
@@ -220,11 +346,11 @@ def phone_fingerprint(phone: str | None) -> str:
 
 
 def dedupe_intelligence_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop duplicates by (name, email, phone); empty triples use row content hash."""
+    """Drop duplicates by (person_name|name, email, phone)."""
     seen: set[tuple[Any, ...]] = set()
     out: list[dict[str, Any]] = []
     for r in rows:
-        n = (r.get("name") or "").strip().lower()
+        n = (r.get("person_name") or r.get("name") or "").strip().lower()
         e = (r.get("email") or "").strip().lower()
         p = phone_fingerprint(r.get("phone"))
         key = (n, e, p)
