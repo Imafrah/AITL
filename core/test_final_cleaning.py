@@ -347,29 +347,106 @@ class TestQualityScoreAndSummary:
 # ── 7. Output Modes ──────────────────────────────────────────────────────────
 
 class TestOutputModes:
-    def test_strict_mode_removes_more(self):
-        """Strict mode has a lower missing threshold (0.25 vs 0.50)."""
+    def test_safe_mode_keeps_all_rows(self):
+        """SAFE mode should keep ALL rows, even those with lots of missing data."""
         records = [
             {"a": 1, "b": 2, "c": 3, "d": 4},
-            {"a": None, "b": None, "c": 3, "d": 4},  # 50% missing → kept in safe, removed in strict
+            {"a": None, "b": None, "c": None, "d": 4},  # 75% missing
+            {"a": 10, "b": 20, "c": 30, "d": 40},
+        ]
+        cleaned, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="safe"))
+        assert stats["low_quality_removed"] == 0, "Safe mode should not remove any rows"
+        assert len(cleaned) == 3
+
+    def test_strict_mode_removes_low_quality(self):
+        """STRICT mode should remove rows with >25% missing data."""
+        records = [
+            {"a": 1, "b": 2, "c": 3, "d": 4},
+            {"a": None, "b": None, "c": 3, "d": 4},  # 50% missing → removed
             {"a": 1, "b": 2, "c": 3, "d": 4},
         ]
+        cleaned, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
+        assert stats["low_quality_removed"] >= 1, "Strict mode should remove low-quality rows"
+
+    def test_strict_removes_more_than_safe(self):
+        """Strict mode must always remove >= safe mode rows."""
+        records = _sample_records()
         _, safe_stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="safe"))
         _, strict_stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
         assert strict_stats["low_quality_removed"] >= safe_stats["low_quality_removed"]
 
-    def test_email_remove_row_strategy(self):
+    def test_strict_removes_invalid_email_rows(self):
+        """STRICT mode removes rows where any email column is invalid."""
+        records = [
+            {"name": "Alice", "email": "alice@test.com", "score": 90},
+            {"name": "Bob", "email": "not-an-email", "score": 85},
+            {"name": "Carol", "email": "carol@test.com", "score": 92},
+            {"name": "Dave", "email": None, "score": 88},
+        ]
+        cleaned, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
+        # Bob (invalid email) and Dave (null email) should be removed
+        remaining_names = [r.get("name") for r in cleaned]
+        assert "Bob" not in remaining_names, "Strict should remove invalid email rows"
+        assert "Dave" not in remaining_names, "Strict should remove null email rows"
+        assert "Alice" in remaining_names
+        assert "Carol" in remaining_names
+
+    def test_strict_removes_null_critical_fields(self):
+        """STRICT mode removes rows where critical fields are null."""
+        records = [
+            {"name": "Alice", "amount": 100, "status": "Active"},
+            {"name": "Bob", "amount": 200, "status": "Active"},
+            {"name": "Carol", "amount": 300, "status": "Active"},
+            {"name": None, "amount": None, "status": None},  # all critical null
+            {"name": "Eve", "amount": 500, "status": "Active"},
+        ]
+        cleaned, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
+        # The row with all nulls should be removed
+        assert stats["low_quality_removed"] >= 1
+        assert len(cleaned) < len(records)
+
+    def test_strict_detects_critical_fields(self):
+        """STRICT mode should populate critical_fields_detected in stats."""
+        records = _sample_records()
+        _, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
+        assert "critical_fields_detected" in stats
+        assert isinstance(stats["critical_fields_detected"], list)
+
+    def test_safe_mode_still_honours_email_remove_row(self):
+        """SAFE mode should still respect explicit email_invalid_strategy=remove_row."""
         records = [
             {"name": "Alice", "email": "alice@test.com"},
             {"name": "Bob", "email": "invalid"},
             {"name": "Carol", "email": "carol@test.com"},
         ]
         cleaned, stats = run_final_cleaning_layer(
-            records, config=_cfg(email_invalid_strategy="remove_row")
+            records, config=_cfg(clean_mode="safe", email_invalid_strategy="remove_row")
         )
-        # Bob's row should be removed
-        names = [r.get("name") for r in cleaned]
-        assert "Bob" not in names or stats["cleaning_summary"]["rows_removed"] >= 1
+        remaining_names = [r.get("name") for r in cleaned]
+        assert "Bob" not in remaining_names or stats["cleaning_summary"]["rows_removed"] >= 1
+
+    def test_clean_mode_in_stats(self):
+        """Stats must report which mode was used."""
+        _, safe_stats = run_final_cleaning_layer(
+            [{"a": 1}], config=_cfg(clean_mode="safe")
+        )
+        _, strict_stats = run_final_cleaning_layer(
+            [{"a": 1}], config=_cfg(clean_mode="strict")
+        )
+        assert safe_stats["clean_mode"] == "safe"
+        assert strict_stats["clean_mode"] == "strict"
+
+    def test_strict_numeric_must_be_present(self):
+        """STRICT mode requires at least half of numeric fields to be present."""
+        records = [
+            {"name": "A", "email": "a@t.com", "score": 90, "grade": 85, "rank": 1},
+            {"name": "B", "email": "b@t.com", "score": None, "grade": None, "rank": None},  # 0/3 numeric
+            {"name": "C", "email": "c@t.com", "score": 88, "grade": 80, "rank": 3},
+        ]
+        cleaned, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
+        # Row B has 0/3 numeric fields → should be removed
+        remaining_names = [r.get("name") for r in cleaned]
+        assert "B" not in remaining_names, "Strict should remove rows with missing numeric fields"
 
 
 # ── 8. ID-Like Text NOT Filled With Placeholder ─────────────────────────────
@@ -492,10 +569,11 @@ class TestEdgeCases:
         assert "quality_score" in stats["cleaning_summary"]
 
     def test_all_none_values(self):
-        records = [{"a": None, "b": None}, {"a": None, "b": None}]
+        records = [{"a": None, "b": None, "c": 1}, {"a": None, "b": None, "c": 2}]
         cleaned, stats = run_final_cleaning_layer(records, config=_cfg())
-        # In safe mode these rows have 100% missing → should be removed
+        # Safe mode keeps all rows; null rate should be high
         assert stats["cleaning_summary"]["null_rate_before"] > 0
+        assert len(cleaned) == 2, "Safe mode keeps all rows even with many nulls"
 
 
 # ── 12. Data Integrity: No Fabricated Values ─────────────────────────────────

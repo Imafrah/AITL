@@ -31,7 +31,7 @@ from core.cleaning import (
     normalize_date_value,
     normalize_status_value,
 )
-from core.schema_cleanup import validate_row_numeric_aggregate
+from core.schema_cleanup import infer_critical_fields, validate_row_numeric_aggregate
 from parsers.csv_parser import normalize_field_name
 
 logger = logging.getLogger(__name__)
@@ -652,7 +652,6 @@ def run_final_cleaning_layer(
     logger.info("Schema enforced")
 
     schema_keys = list(working[0].keys())
-    missing_threshold = 0.25 if cfg.clean_mode == "strict" else 0.5
 
     # ── Measure null rate BEFORE cleaning ──
     null_rate_before = _compute_null_rate(working, schema_keys)
@@ -770,23 +769,68 @@ def run_final_cleaning_layer(
                     im = r.setdefault("__imputed__", {})
                     im[k] = "median"
 
+    # ── Row quality filtering — mode-aware ──
+    # SAFE:   keep ALL rows; only replace invalid values (already done above)
+    # STRICT: aggressively remove rows with null critical fields, invalid
+    #         emails, or missing numeric data
     before_filter = len(working)
     kept: list[dict[str, Any]] = []
-    for r in working:
-        if _missing_ratio(r, schema_keys) > missing_threshold:
-            continue
-        if cfg.email_invalid_strategy == "remove_row":
-            drop = False
-            for ek in email_cols:
-                if not _is_present(r.get(ek)) or not is_valid_email(str(r.get(ek))):
-                    drop = True
-                    break
-            if drop:
+
+    if cfg.clean_mode == "strict":
+        # Detect critical fields dynamically (high fill-rate, id-like, numeric-heavy)
+        critical_fields = infer_critical_fields(working)
+        stats["critical_fields_detected"] = critical_fields
+        logger.info("Strict mode | critical fields detected: %s", critical_fields)
+
+        for r in working:
+            # 1. General missing-ratio filter (tight threshold)
+            if _missing_ratio(r, schema_keys) > 0.25:
                 continue
-        kept.append(r)
+
+            # 2. Critical fields must not be null
+            critical_missing = False
+            for cf in critical_fields:
+                if not _is_present(r.get(cf)):
+                    critical_missing = True
+                    break
+            if critical_missing:
+                continue
+
+            # 3. Email columns must be valid (strict rejects all bad emails)
+            email_bad = False
+            for ek in email_cols:
+                ev = r.get(ek)
+                if not _is_present(ev) or not is_valid_email(str(ev)):
+                    email_bad = True
+                    break
+            if email_cols and email_bad:
+                continue
+
+            # 4. Numeric fields — at least half must be present
+            if numeric_cols:
+                num_present = sum(1 for nk in numeric_cols if _is_present(r.get(nk)))
+                if num_present < max(1, len(numeric_cols) // 2):
+                    continue
+
+            kept.append(r)
+    else:
+        # SAFE mode: keep ALL rows — no quality-based removal
+        stats["critical_fields_detected"] = []
+        # Only honour explicit email_invalid_strategy="remove_row" if set
+        for r in working:
+            if cfg.email_invalid_strategy == "remove_row":
+                drop = False
+                for ek in email_cols:
+                    if not _is_present(r.get(ek)) or not is_valid_email(str(r.get(ek))):
+                        drop = True
+                        break
+                if drop:
+                    continue
+            kept.append(r)
+
     removed = before_filter - len(kept)
     if removed:
-        logger.info("Low-quality rows removed")
+        logger.info("%s mode | rows removed: %d", cfg.clean_mode.upper(), removed)
     stats["low_quality_removed"] = removed
 
     working = kept
