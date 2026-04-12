@@ -56,17 +56,8 @@ FUZZY_THRESHOLD = 85
 # ── Step 1: Schema Validator ──────────────────────────────────────────────────
 
 def validate_schema(ai_output: dict) -> dict:
-    """Ensure AI output has correct structure. Fill missing keys with defaults."""
-    return {
-        "document_type": ai_output.get("document_type", "unknown"),
-        "entities": {
-            "person_names": ai_output.get("entities", {}).get("person_names", []),
-            "organizations": ai_output.get("entities", {}).get("organizations", []),
-            "dates": ai_output.get("entities", {}).get("dates", []),
-            "amounts": ai_output.get("entities", {}).get("amounts", []),
-        },
-        "relationships": ai_output.get("relationships", []),
-    }
+    """Structure is strictly enforced by AI schema."""
+    return ai_output
 
 
 # ── Step 2: Date Cleaner ──────────────────────────────────────────────────────
@@ -100,11 +91,18 @@ def clean_dates(dates: list) -> list:
 
 # ── Step 3: Amount Cleaner ────────────────────────────────────────────────────
 
-def normalize_currency(currency: str) -> str:
-    return CURRENCY_MAP.get(currency.strip().lower(), currency.strip().upper())
+def normalize_currency(currency: str | None) -> str:
+    raw = (currency or "").strip()
+    if not raw:
+        return ""
+    key = raw.lower()
+    return CURRENCY_MAP.get(key, raw.upper())
 
-def normalize_label(label: str) -> str:
-    return LABEL_MAP.get(label.strip().lower(), label.strip().lower())
+def normalize_label(label: str | None) -> str:
+    raw = (label or "").strip().lower()
+    if not raw:
+        return ""
+    return LABEL_MAP.get(raw, raw)
 
 def clean_amounts(amounts: list) -> list:
     cleaned = []

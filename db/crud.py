@@ -5,8 +5,8 @@ class DBError(Exception):
 
 def save_document(document_id: str, source_file: str, document_type: str,
                   status: str, raw_text: str, structured_output: dict):
+    db = SessionLocal()
     try:
-        db = SessionLocal()
         doc = Document(
             document_id=document_id,
             source_file=source_file,
@@ -17,17 +17,18 @@ def save_document(document_id: str, source_file: str, document_type: str,
         )
         db.add(doc)
         db.commit()
-        db.close()
     except Exception as e:
-        raise DBError(f"Failed to save document: {e}")
+        db.rollback()
+        raise DBError(f"Failed to save document: {e}") from e
+    finally:
+        db.close()
 
-def get_document(document_id: str) -> dict:
+def get_document(document_id: str) -> dict | None:
+    db = SessionLocal()
     try:
-        db = SessionLocal()
         doc = db.query(Document).filter(
             Document.document_id == document_id
         ).first()
-        db.close()
         if not doc:
             return None
         return {
@@ -39,4 +40,6 @@ def get_document(document_id: str) -> dict:
             "created_at": doc.created_at.isoformat()
         }
     except Exception as e:
-        raise DBError(f"Failed to fetch document: {e}")
+        raise DBError(f"Failed to fetch document: {e}") from e
+    finally:
+        db.close()

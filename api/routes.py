@@ -1,4 +1,9 @@
+import os
+import asyncio
+from pathlib import Path
+
 from fastapi import APIRouter, UploadFile, File, HTTPException
+
 from db.crud import get_document, DBError
 from orchestrator import run_pipeline
 
@@ -8,20 +13,35 @@ ALLOWED_EXTENSIONS = {"pdf", "csv", "txt"}
 MAX_FILE_SIZE = 10 * 1024 * 1024
 
 
+def _extension_from_filename(name: str | None) -> str | None:
+    if not name or not name.strip():
+        return None
+    suffix = Path(name.strip()).suffix.lower().lstrip(".")
+    return suffix or None
+
+
 @router.post("/translate")
 async def translate(file: UploadFile = File(...)):
-    import os
+    ext = _extension_from_filename(file.filename)
+    if not ext or ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unsupported or missing file extension: {ext or 'none'}. "
+                "Allowed: pdf, csv, txt"
+            ),
+        )
 
-    ext = file.filename.split(".")[-1].lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=422,
-            detail=f"Unsupported file type: {ext}. Allowed: pdf, csv, txt")
+    content = b""
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        content += chunk
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=422,
+                detail="File too large. Maximum size is 10MB.")
 
-    content = await file.read()
-
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=422,
-            detail="File too large. Maximum size is 10MB.")
     if len(content) == 0:
         raise HTTPException(status_code=422,
             detail="File is empty.")
@@ -31,7 +51,11 @@ async def translate(file: UploadFile = File(...)):
             detail="Server configuration error: GEMINI_API_KEY is not set.")
 
     try:
-        result = run_pipeline(content, ext, file.filename)
+        if ext == "csv":
+            from parsers.csv_parser import parse_csv
+            result = await asyncio.to_thread(parse_csv, content)
+        else:
+            result = await asyncio.to_thread(run_pipeline, content, ext, file.filename)
     except Exception as e:
         raise HTTPException(status_code=500,
             detail=f"Processing failed: {str(e)}")

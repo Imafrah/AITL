@@ -1,6 +1,11 @@
 import { useState } from "react"
 import axios from "axios"
 
+/** Dev: empty string uses Vite proxy to backend. Prod: set VITE_API_BASE_URL or default host. */
+const API_BASE =
+  import.meta.env.VITE_API_BASE_URL ??
+  (import.meta.env.PROD ? "https://aitl.onrender.com" : "")
+
 export default function App() {
   const [file, setFile] = useState(null)
   const [result, setResult] = useState(null)
@@ -17,7 +22,7 @@ export default function App() {
     formData.append("file", file)
 
     try {
-      const res = await axios.post("https://aitl.onrender.com/translate", formData)
+      const res = await axios.post(`${API_BASE}/translate`, formData)
       setResult(res.data)
     } catch (err) {
       setError(err.response?.data?.detail || "Something went wrong.")

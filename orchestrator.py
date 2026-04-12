@@ -1,4 +1,5 @@
 import os
+import uuid
 from parsers.router import route_file
 from parsers.txt_parser import ParseError
 from ai_layer.extractor import extract_entities, AIServiceError
@@ -129,11 +130,14 @@ def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
     except ValidationError as e:
         logger.error(f"Post-processing failed | {e}")
         result = {
+            "document_id": str(uuid.uuid4()),
+            "document_type": ai_output.get("document_type", "unknown"),
+            "source_file": filename,
             "status": "partial",
             "error": f"Post-processing failed: {str(e)}",
             "entities": ai_output.get("entities", {}),
-            "relationships": [],
-            "metadata": parsed["metadata"]
+            "relationships": ai_output.get("relationships", []),
+            "metadata": parsed["metadata"],
         }
 
     # Step 6: Save to DB

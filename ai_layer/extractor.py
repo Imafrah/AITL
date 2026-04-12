@@ -1,17 +1,49 @@
 import json
 from google import genai
+from pydantic import BaseModel, Field
+from typing import Dict, Any
 
 class AIServiceError(Exception):
     pass
 
+# ── Pydantic Schemas ──────────────────────────────────────────────────────────
+
+class EntityBase(BaseModel):
+    value: str
+    confidence: float = Field(ge=0.0, le=1.0)
+
+class DateEntity(EntityBase):
+    label: str
+
+class AmountEntity(BaseModel):
+    value: float
+    currency: str
+    label: str
+    confidence: float = Field(ge=0.0, le=1.0)
+
+class Entities(BaseModel):
+    person_names: list[EntityBase] = []
+    organizations: list[EntityBase] = []
+    dates: list[DateEntity] = []
+    amounts: list[AmountEntity] = []
+
+class Relationship(BaseModel):
+    type: str
+    from_field: str = Field(alias="from", default="")
+    to: str = Field(default="")
+    confidence: float = Field(ge=0.0, le=1.0, default=0.0)
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+
+class DocumentExtraction(BaseModel):
+    document_type: str
+    entities: Entities
+    relationships: list[Relationship] = []
 
 # ── Prompt Registry ───────────────────────────────────────────────────────────
 
 PROMPTS = {
     "invoice": """
 You are a precise invoice data extraction engine.
-Return ONLY valid JSON. No explanation, no markdown, no code blocks.
-
 Extract these fields:
 - Vendor/supplier name (organizations)
 - Customer/buyer name (person_names or organizations)
@@ -28,34 +60,12 @@ Confidence scoring:
 Dates must be in YYYY-MM-DD format where possible.
 Amount values must be numeric only.
 
-OUTPUT FORMAT:
-{{
-  "document_type": "invoice",
-  "entities": {{
-    "person_names": [{{"value": "", "confidence": 0.0}}],
-    "organizations": [{{"value": "", "confidence": 0.0}}],
-    "dates": [{{"value": "", "label": "", "confidence": 0.0}}],
-    "amounts": [{{"value": 0, "currency": "", "label": "", "confidence": 0.0}}]
-  }},
-  "relationships": [
-    {{
-      "type": "payment",
-      "from": "buyer name",
-      "to": "vendor name",
-      "confidence": 0.0,
-      "attributes": {{}}
-    }}
-  ]
-}}
-
 DOCUMENT:
 {text}
 """,
 
     "employee_record": """
 You are a precise HR data extraction engine.
-Return ONLY valid JSON. No explanation, no markdown, no code blocks.
-
 Extract these fields:
 - Employee full names (person_names)
 - Department names (organizations) — normalize misspellings:
@@ -76,34 +86,12 @@ IMPORTANT RULES:
 - Do NOT duplicate names — if same name appears multiple times, extract once
 - Dates must be in YYYY-MM-DD format
 
-OUTPUT FORMAT:
-{{
-  "document_type": "employee_record",
-  "entities": {{
-    "person_names": [{{"value": "", "confidence": 0.0}}],
-    "organizations": [{{"value": "", "confidence": 0.0}}],
-    "dates": [{{"value": "", "label": "date_of_birth", "confidence": 0.0}}],
-    "amounts": [{{"value": 0, "currency": "", "label": "salary", "confidence": 0.0}}]
-  }},
-  "relationships": [
-    {{
-      "type": "employed_by",
-      "from": "employee name",
-      "to": "department name",
-      "confidence": 0.0,
-      "attributes": {{}}
-    }}
-  ]
-}}
-
 DOCUMENT:
 {text}
 """,
 
     "financial_report": """
 You are a precise financial data extraction engine.
-Return ONLY valid JSON. No explanation, no markdown, no code blocks.
-
 Extract these fields:
 - Account holders, customers (person_names)
 - Banks, institutions, companies (organizations)
@@ -123,34 +111,12 @@ IMPORTANT RULES:
 - Normalize currency: $ → USD, € → EUR, £ → GBP, ₹ → INR
 - Dates must be in YYYY-MM-DD format
 
-OUTPUT FORMAT:
-{{
-  "document_type": "financial_report",
-  "entities": {{
-    "person_names": [{{"value": "", "confidence": 0.0}}],
-    "organizations": [{{"value": "", "confidence": 0.0}}],
-    "dates": [{{"value": "", "label": "", "confidence": 0.0}}],
-    "amounts": [{{"value": 0, "currency": "", "label": "", "confidence": 0.0}}]
-  }},
-  "relationships": [
-    {{
-      "type": "transaction",
-      "from": "sender",
-      "to": "receiver",
-      "confidence": 0.0,
-      "attributes": {{}}
-    }}
-  ]
-}}
-
 DOCUMENT:
 {text}
 """,
 
     "contract": """
 You are a precise legal document extraction engine.
-Return ONLY valid JSON. No explanation, no markdown, no code blocks.
-
 Extract these fields:
 - Parties involved (person_names and organizations)
 - Contract start date, end date, signing date (dates with labels)
@@ -165,34 +131,12 @@ Confidence scoring:
 Dates must be in YYYY-MM-DD format.
 Amount values must be numeric only.
 
-OUTPUT FORMAT:
-{{
-  "document_type": "contract",
-  "entities": {{
-    "person_names": [{{"value": "", "confidence": 0.0}}],
-    "organizations": [{{"value": "", "confidence": 0.0}}],
-    "dates": [{{"value": "", "label": "", "confidence": 0.0}}],
-    "amounts": [{{"value": 0, "currency": "", "label": "", "confidence": 0.0}}]
-  }},
-  "relationships": [
-    {{
-      "type": "agreement",
-      "from": "party one",
-      "to": "party two",
-      "confidence": 0.0,
-      "attributes": {{}}
-    }}
-  ]
-}}
-
 DOCUMENT:
 {text}
 """,
 
     "unknown": """
 You are a precise data extraction engine.
-Return ONLY valid JSON. No explanation, no markdown, no code blocks.
-
 Extract whatever structured information you can find:
 - People mentioned (person_names)
 - Organizations mentioned (organizations)
@@ -208,69 +152,62 @@ Confidence scoring:
 Dates must be in YYYY-MM-DD format where possible.
 Amount values must be numeric only.
 
-OUTPUT FORMAT:
-{{
-  "document_type": "unknown",
-  "entities": {{
-    "person_names": [{{"value": "", "confidence": 0.0}}],
-    "organizations": [{{"value": "", "confidence": 0.0}}],
-    "dates": [{{"value": "", "label": "", "confidence": 0.0}}],
-    "amounts": [{{"value": 0, "currency": "", "label": "", "confidence": 0.0}}]
-  }},
-  "relationships": []
-}}
-
 DOCUMENT:
 {text}
 """
 }
 
+# ── Schema Sanitization ───────────────────────────────────────────────────────
 
-# ── LLM Response Cleaner ──────────────────────────────────────────────────────
-
-def clean_llm_response(raw: str) -> str:
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        cleaned = "\n".join(lines).strip()
-
-    # If JSON is truncated, try to salvage it
-    if not cleaned.endswith("}"):
-        last_brace = cleaned.rfind("}")
-        if last_brace != -1:
-            cleaned = cleaned[:last_brace+1]
-            open_brackets = cleaned.count("{") - cleaned.count("}")
-            cleaned += "}" * open_brackets
-
-    return cleaned
+def remove_additional_properties(schema):
+    """Recursively strip 'additionalProperties' since Gemini API rejects it."""
+    if isinstance(schema, dict):
+        schema.pop("additionalProperties", None)
+        for value in schema.values():
+            remove_additional_properties(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            remove_additional_properties(item)
+    return schema
 
 
 # ── Main Extractor ────────────────────────────────────────────────────────────
 
 def extract_entities(text: str, api_key: str, document_type: str = "unknown") -> dict:
     try:
+        from google.genai import types
         client = genai.Client(api_key=api_key)
 
         # Select prompt from registry, fall back to unknown
         prompt_template = PROMPTS.get(document_type, PROMPTS["unknown"])
         prompt = prompt_template.format(text=text)
 
+        # Generate JSON schema and sanitize it
+        schema_dict = DocumentExtraction.model_json_schema()
+        clean_schema = remove_additional_properties(schema_dict)
+
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
-            config={"temperature": 0.2}
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                response_mime_type="application/json",
+                response_schema=clean_schema
+            )
         )
 
-        raw = response.text
-        cleaned = clean_llm_response(raw)
+        raw = getattr(response, "text", None) or ""
+        if not str(raw).strip():
+            raise AIServiceError("Empty response from AI model.")
 
         try:
-            parsed = json.loads(cleaned)
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
-            raise AIServiceError(f"Invalid JSON from AI:\n{cleaned[:300]}")
+            raise AIServiceError(f"Invalid JSON from AI:\n{raw[:300]}")
 
         return parsed
 
+    except AIServiceError:
+        raise
     except Exception as e:
-        raise AIServiceError(f"AI service failed: {e}")
+        raise AIServiceError(f"AI service failed: {e}") from e

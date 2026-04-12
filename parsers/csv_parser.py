@@ -1,39 +1,253 @@
+import csv
 import io
-import pandas as pd
-from parsers.txt_parser import ParseError
+import uuid
+import logging
 
-def parse_csv(file_bytes: bytes) -> dict:
+logger = logging.getLogger("csv_parser")
+
+def normalize_payment(method: str) -> str:
+    """Normalize payment method strings."""
+    if not method:
+        return ""
+    m = method.strip().lower()
+    if m in ["paypal", "pay pal"]:
+        return "PayPal"
+    if m in ["creditcard", "credit card"]:
+        return "Credit Card"
+    if m == "cash":
+        return "Cash"
+    return method.strip().title()
+
+def safe_float(value: str) -> float | None:
+    """Safely convert string to float."""
+    if not value:
+        return None
+    # Remove currency symbols and commas if any
+    clean_val = str(value).replace('$', '').replace(',', '').strip()
     try:
-        # Try UTF-8 first, fall back to latin-1
-        try:
-            text_io = io.StringIO(file_bytes.decode("utf-8"))
-        except UnicodeDecodeError:
-            text_io = io.StringIO(file_bytes.decode("latin-1"))
+        return float(clean_val)
+    except ValueError:
+        return None
 
-        df = pd.read_csv(text_io)
+def process_transaction_row(row: dict, row_index: int) -> dict:
+    doc_id = row.get("Transaction_ID") or f"txn-{row_index}"
+    
+    # Extract data
+    date_val = row.get("Transaction_Date", "")
+    customer = row.get("Customer_ID", "")
+    price = safe_float(row.get("Price", ""))
+    payment = normalize_payment(row.get("Payment_Method", ""))
+    status = str(row.get("Transaction_Status", "")).lower()
+    
+    entities = {
+        "person_names": [],
+        "organizations": [],
+        "dates": [],
+        "amounts": []
+    }
+    relationships = []
+    
+    p1_id = "p1"
+    if customer:
+        entities["person_names"].append({"id": p1_id, "value": customer, "confidence": 1.0})
+        
+    o1_id = "o1"
+    if payment:
+        entities["organizations"].append({"id": o1_id, "value": payment, "confidence": 0.95})
+        
+    d1_id = "d1"
+    if date_val:
+        entities["dates"].append({"id": d1_id, "value": date_val, "confidence": 1.0})
+        
+    a1_id = "a1"
+    if price is not None:
+        entities["amounts"].append({"id": a1_id, "value": price, "currency": "USD", "label": "transaction_amount", "confidence": 1.0})
+        
+    if customer and payment:
+        rel_attrs = {}
+        if price is not None: 
+            rel_attrs["amount"] = a1_id
+        if date_val: 
+            rel_attrs["date"] = d1_id
+            
+        relationships.append({
+            "type": "payment",
+            "from": p1_id,
+            "to": o1_id,
+            "confidence": 0.95,
+            "attributes": rel_attrs
+        })
 
-        if df.empty:
-            raise ParseError("CSV file is empty or has no data rows.")
+    doc_status = "success"
+    if status and status != "success" and status != "completed":
+        doc_status = "partial"
 
-        # Convert dataframe to readable text for AI
-        text = df.to_string(index=False)
-
-        # Also capture column summary
-        columns = list(df.columns)
-        row_count = len(df)
-
-        return {
-            "text": text,
-            "metadata": {
-                "file_type": "csv",
-                "page_count": None,
-                "word_count": len(text.split()),
-                "row_count": row_count,
-                "columns": columns
-            }
+    return {
+        "document_id": doc_id,
+        "document_type": "transaction",
+        "status": doc_status,
+        "error": None,
+        "entities": entities,
+        "relationships": relationships,
+        "metadata": {
+            "file_type": "csv"
         }
+    }
 
-    except ParseError:
-        raise
-    except Exception as e:
-        raise ParseError(f"Failed to parse CSV: {e}")
+def process_employee_row(row: dict, row_index: int) -> dict:
+    doc_id = row.get("Employee_ID") or f"emp-{row_index}"
+    
+    name = row.get("Name", "")
+    dept = row.get("Department", "")
+    salary = safe_float(row.get("Salary", ""))
+    
+    entities = {
+        "person_names": [],
+        "organizations": [],
+        "dates": [],
+        "amounts": []
+    }
+    relationships = []
+    
+    p1_id = "p1"
+    if name:
+        entities["person_names"].append({"id": p1_id, "value": name, "confidence": 1.0})
+        
+    o1_id = "o1"
+    if dept:
+        entities["organizations"].append({"id": o1_id, "value": dept, "confidence": 1.0})
+        
+    a1_id = "a1"
+    if salary is not None:
+        entities["amounts"].append({"id": a1_id, "value": salary, "currency": "USD", "label": "salary", "confidence": 1.0})
+        
+    if name and dept:
+        rel_attrs = {}
+        if salary is not None: 
+            rel_attrs["amount"] = a1_id
+            
+        relationships.append({
+            "type": "employed_by",
+            "from": p1_id,
+            "to": o1_id,
+            "confidence": 1.0,
+            "attributes": rel_attrs
+        })
+
+    return {
+        "document_id": doc_id,
+        "document_type": "employee_record",
+        "status": "success",
+        "error": None,
+        "entities": entities,
+        "relationships": relationships,
+        "metadata": {
+            "file_type": "csv"
+        }
+    }
+
+def process_sales_row(row: dict, row_index: int) -> dict:
+    doc_id = f"sales-{row_index}"
+    vendor = row.get("vendor", "")
+    amount = safe_float(row.get("amount", ""))
+    currency = row.get("currency", "USD")
+    date_val = row.get("date", "")
+    
+    entities = {"person_names": [], "organizations": [], "dates": [], "amounts": []}
+    relationships = []
+    
+    o1_id = "o1"
+    if vendor:
+        entities["organizations"].append({"id": o1_id, "value": vendor, "confidence": 1.0})
+        
+    d1_id = "d1"
+    if date_val:
+        entities["dates"].append({"id": d1_id, "value": date_val, "confidence": 1.0})
+        
+    a1_id = "a1"
+    if amount is not None:
+        entities["amounts"].append({"id": a1_id, "value": amount, "currency": currency, "label": "sale_amount", "confidence": 1.0})
+        
+    if vendor and amount is not None:
+        relationships.append({
+            "type": "sale",
+            "from": o1_id,
+            "to": "unknown_buyer",
+            "confidence": 0.9,
+            "attributes": {"amount": a1_id}
+        })
+        
+    return {
+        "document_id": doc_id,
+        "document_type": "sales_record",
+        "status": "success",
+        "error": None,
+        "entities": entities,
+        "relationships": relationships,
+        "metadata": {"file_type": "csv"}
+    }
+
+
+def parse_csv(file_bytes: bytes) -> list[dict]:
+    """Parse CSV content synchronously without AI logic."""
+    try:
+        content = file_bytes.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        content = file_bytes.decode('latin-1')
+
+    reader = csv.DictReader(io.StringIO(content))
+    fieldnames = reader.fieldnames or []
+    
+    # Auto-detect schema by finding matching headers
+    is_transaction = any(k in fieldnames for k in ["Transaction_ID", "Payment_Method", "Transaction_Status", "Customer_ID"])
+    is_employee = any(k in fieldnames for k in ["Employee_ID", "Department", "Salary", "Name"])
+    is_sales = any(k in fieldnames for k in ["vendor", "amount"])
+    
+    results = []
+    MAX_ROWS = 1000
+    
+    for idx, row in enumerate(reader):
+        if idx >= MAX_ROWS:
+            logger.warning(f"CSV exceeded maximum allowed rows ({MAX_ROWS}). Truncating.")
+            break
+            
+        # skip completely empty rows safely
+        if not any(str(v).strip() for v in row.values() if v is not None):
+            continue
+            
+        try:
+            if is_transaction:
+                doc = process_transaction_row(row, idx + 1)
+            elif is_employee:
+                doc = process_employee_row(row, idx + 1)
+            elif is_sales:
+                doc = process_sales_row(row, idx + 1)
+            else:
+                # Generic fallback if columns don't match specific schemas
+                doc = {
+                    "document_id": f"row-{uuid.uuid4()}",
+                    "document_type": "unknown_csv",
+                    "status": "partial",
+                    "error": "Unrecognized CSV schema format.",
+                    "entities": {"person_names": [], "organizations": [], "dates": [], "amounts": []},
+                    "relationships": [],
+                    "metadata": {"file_type": "csv"}
+                }
+            results.append(doc)
+            
+            # TODO: Plug in Database Integration hooks here!
+            # Example: db.crud.bulk_save_documents([doc]) if tracking CSV output inside DB
+            
+        except Exception as e:
+            logger.error(f"Error processing row {idx}: {e}")
+            results.append({
+                "document_id": f"error-{idx}",
+                "document_type": "error",
+                "status": "failed",
+                "error": str(e),
+                "entities": {"person_names": [], "organizations": [], "dates": [], "amounts": []},
+                "relationships": [],
+                "metadata": {"file_type": "csv"}
+            })
+
+    return results
