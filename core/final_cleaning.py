@@ -756,6 +756,15 @@ def run_final_cleaning_layer(
                 vals.append(float(v))
         if len(vals) < cfg.min_values_for_median:
             continue
+            
+        # STRICT mode rule: only impute numerics if null rate is < 20%
+        # Otherwise, we keep them null so the strict row filter will drop them.
+        if cfg.clean_mode == "strict":
+            missing_count = sum(1 for r in working if not _is_present(r.get(k)))
+            null_rate = missing_count / len(working) if working else 1.0
+            if null_rate >= 0.20:
+                continue
+                
         med = _median(vals)
         if med is None:
             continue
@@ -796,7 +805,7 @@ def run_final_cleaning_layer(
             if critical_missing:
                 continue
 
-            # 3. Email columns must be valid (strict rejects all bad emails)
+            # 3. Email columns must be valid (strict rejects all bad/null emails)
             email_bad = False
             for ek in email_cols:
                 ev = r.get(ek)
@@ -806,11 +815,14 @@ def run_final_cleaning_layer(
             if email_cols and email_bad:
                 continue
 
-            # 4. Numeric fields — at least half must be present
-            if numeric_cols:
-                num_present = sum(1 for nk in numeric_cols if _is_present(r.get(nk)))
-                if num_present < max(1, len(numeric_cols) // 2):
-                    continue
+            # 4. Numeric fields must not be missing (any missing -> drop row)
+            numeric_bad = False
+            for nk in numeric_cols:
+                if not _is_present(r.get(nk)):
+                    numeric_bad = True
+                    break
+            if numeric_cols and numeric_bad:
+                continue
 
             kept.append(r)
     else:
@@ -837,7 +849,8 @@ def run_final_cleaning_layer(
 
     for r in working:
         _normalize_strings_inplace(r)
-        if cfg.text_missing_placeholder and text_cols:
+        # Never fabricate values in strict mode
+        if cfg.text_missing_placeholder and text_cols and cfg.clean_mode != "strict":
             for k in text_cols:
                 # Never fill phone-like, email, or ID-like text columns with placeholders
                 if k in phone_like | email_cols | id_like_text:
