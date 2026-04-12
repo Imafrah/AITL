@@ -54,8 +54,9 @@ async def translate(file: UploadFile = File(...)):
 
     try:
         if ext == "csv":
-            from parsers.csv_parser import parse_csv
-            result = await asyncio.to_thread(parse_csv, content)
+            from parsers.csv_parser import parse_csv_documents
+
+            result = await asyncio.to_thread(parse_csv_documents, content)
         else:
             result = await asyncio.to_thread(run_pipeline, content, ext, file.filename)
     except Exception as e:

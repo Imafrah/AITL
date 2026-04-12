@@ -1,6 +1,9 @@
-import pdfplumber
 import io
+
+import pdfplumber
+
 from parsers.txt_parser import ParseError
+from utils.data_cleaner import clean_pdf_text
 
 def parse_pdf(file_bytes: bytes) -> dict:
     try:
@@ -21,6 +24,11 @@ def parse_pdf(file_bytes: bytes) -> dict:
 
         if not full_text:
             raise ParseError("Could not extract text from PDF. It may be scanned or image-based.")
+
+        full_text = clean_pdf_text(full_text)
+
+        if not full_text:
+            raise ParseError("PDF has no usable content after cleaning.")
 
         return {
             "text": full_text,

@@ -3,6 +3,11 @@ import io
 import uuid
 import logging
 
+import pandas as pd
+
+from parsers.txt_parser import ParseError
+from utils.data_cleaner import clean_csv_row, clean_csv_text_output, get_cleaning_stats
+
 logger = logging.getLogger("csv_parser")
 
 def normalize_payment(method: str) -> str:
@@ -188,33 +193,81 @@ def process_sales_row(row: dict, row_index: int) -> dict:
     }
 
 
-def parse_csv(file_bytes: bytes) -> list[dict]:
-    """Parse CSV content synchronously without AI logic."""
+def parse_csv(file_bytes: bytes) -> dict:
+    """
+    Build cleaned plain text + metadata from CSV for the AI pipeline (orchestrator).
+    """
     try:
-        content = file_bytes.decode('utf-8-sig')
+        try:
+            text_io = io.StringIO(file_bytes.decode("utf-8-sig"))
+        except UnicodeDecodeError:
+            text_io = io.StringIO(file_bytes.decode("latin-1"))
+
+        df = pd.read_csv(text_io)
+
+        if df.empty:
+            raise ParseError("CSV file is empty or has no data rows.")
+
+        original_rows = df.to_dict(orient="records")
+        cleaned_rows = [clean_csv_row(dict(row)) for row in original_rows]
+        cleaned_df = pd.DataFrame(cleaned_rows)
+        cleaned_df = cleaned_df.where(pd.notnull(cleaned_df), None)
+
+        stats = get_cleaning_stats(original_rows, cleaned_rows)
+
+        text = cleaned_df.to_string(index=False)
+        text = clean_csv_text_output(text)
+
+        if not text.strip():
+            raise ParseError("File has no usable content after cleaning.")
+
+        return {
+            "text": text,
+            "metadata": {
+                "file_type": "csv",
+                "page_count": None,
+                "word_count": len(text.split()),
+                "row_count": len(cleaned_df),
+                "columns": list(cleaned_df.columns),
+                "cleaning_stats": stats,
+            },
+        }
+    except ParseError:
+        raise
+    except Exception as e:
+        raise ParseError(f"Failed to parse CSV: {e}") from e
+
+
+def parse_csv_documents(file_bytes: bytes) -> list[dict]:
+    """Parse CSV into one structured document per row (translate API, no AI)."""
+    try:
+        content = file_bytes.decode("utf-8-sig")
     except UnicodeDecodeError:
-        content = file_bytes.decode('latin-1')
+        content = file_bytes.decode("latin-1")
 
     reader = csv.DictReader(io.StringIO(content))
     fieldnames = reader.fieldnames or []
-    
-    # Auto-detect schema by finding matching headers
-    is_transaction = any(k in fieldnames for k in ["Transaction_ID", "Payment_Method", "Transaction_Status", "Customer_ID"])
+
+    is_transaction = any(
+        k in fieldnames
+        for k in ["Transaction_ID", "Payment_Method", "Transaction_Status", "Customer_ID"]
+    )
     is_employee = any(k in fieldnames for k in ["Employee_ID", "Department", "Salary", "Name"])
     is_sales = any(k in fieldnames for k in ["vendor", "amount"])
-    
+
     results = []
     MAX_ROWS = 1000
-    
+
     for idx, row in enumerate(reader):
         if idx >= MAX_ROWS:
             logger.warning(f"CSV exceeded maximum allowed rows ({MAX_ROWS}). Truncating.")
             break
-            
-        # skip completely empty rows safely
+
         if not any(str(v).strip() for v in row.values() if v is not None):
             continue
-            
+
+        row = clean_csv_row(dict(row))
+
         try:
             if is_transaction:
                 doc = process_transaction_row(row, idx + 1)
@@ -223,31 +276,39 @@ def parse_csv(file_bytes: bytes) -> list[dict]:
             elif is_sales:
                 doc = process_sales_row(row, idx + 1)
             else:
-                # Generic fallback if columns don't match specific schemas
                 doc = {
                     "document_id": f"row-{uuid.uuid4()}",
                     "document_type": "unknown_csv",
                     "status": "partial",
                     "error": "Unrecognized CSV schema format.",
-                    "entities": {"person_names": [], "organizations": [], "dates": [], "amounts": []},
+                    "entities": {
+                        "person_names": [],
+                        "organizations": [],
+                        "dates": [],
+                        "amounts": [],
+                    },
                     "relationships": [],
-                    "metadata": {"file_type": "csv"}
+                    "metadata": {"file_type": "csv"},
                 }
             results.append(doc)
-            
-            # TODO: Plug in Database Integration hooks here!
-            # Example: db.crud.bulk_save_documents([doc]) if tracking CSV output inside DB
-            
+
         except Exception as e:
             logger.error(f"Error processing row {idx}: {e}")
-            results.append({
-                "document_id": f"error-{idx}",
-                "document_type": "error",
-                "status": "failed",
-                "error": str(e),
-                "entities": {"person_names": [], "organizations": [], "dates": [], "amounts": []},
-                "relationships": [],
-                "metadata": {"file_type": "csv"}
-            })
+            results.append(
+                {
+                    "document_id": f"error-{idx}",
+                    "document_type": "error",
+                    "status": "failed",
+                    "error": str(e),
+                    "entities": {
+                        "person_names": [],
+                        "organizations": [],
+                        "dates": [],
+                        "amounts": [],
+                    },
+                    "relationships": [],
+                    "metadata": {"file_type": "csv"},
+                }
+            )
 
     return results

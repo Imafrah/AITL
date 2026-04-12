@@ -2,6 +2,7 @@ import os
 import uuid
 from parsers.router import route_file
 from parsers.txt_parser import ParseError
+from utils.data_cleaner import get_text_quality_score
 from ai_layer.extractor import extract_entities, AIServiceError
 from post_processor.processor import post_process, ValidationError
 from db.crud import save_document, DBError
@@ -88,6 +89,10 @@ def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
     # Step 2: Detect document type from full text + filename
     document_type = detect_document_type(parsed["text"], filename)
     logger.info(f"Document type detected: {document_type}")
+
+    quality_score = get_text_quality_score(parsed["text"])
+    logger.info(f"Text quality score: {quality_score}")
+    parsed["metadata"]["text_quality_score"] = quality_score
 
     # Step 3: Truncate for AI only AFTER detection
     if file_type == "csv":

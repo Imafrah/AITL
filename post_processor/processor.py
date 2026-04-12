@@ -254,6 +254,10 @@ def post_process(ai_output: dict, source_file: str, file_metadata: dict) -> dict
         # Compute confidence
         confidence_overall = compute_overall_confidence(entities_with_ids)
 
+        meta = dict(file_metadata or {})
+        meta["confidence_overall"] = confidence_overall
+        meta["processed_at"] = datetime.now(timezone.utc).isoformat()
+
         return {
             "document_id": str(uuid.uuid4()),
             "document_type": data["document_type"],
@@ -262,13 +266,7 @@ def post_process(ai_output: dict, source_file: str, file_metadata: dict) -> dict
             "error": None,
             "entities": entities_with_ids,
             "relationships": relationships,
-            "metadata": {
-                "file_type": file_metadata.get("file_type"),
-                "page_count": file_metadata.get("page_count"),
-                "word_count": file_metadata.get("word_count"),
-                "confidence_overall": confidence_overall,
-                "processed_at": datetime.now(timezone.utc).isoformat()
-            }
+            "metadata": meta,
         }
 
     except Exception as e:

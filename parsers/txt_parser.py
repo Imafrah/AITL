@@ -1,22 +1,37 @@
+from utils.data_cleaner import clean_txt_text
+
+
 class ParseError(Exception):
     pass
 
+
 def parse_txt(file_bytes: bytes) -> dict:
     try:
-        text = file_bytes.decode("utf-8").strip()
-    except UnicodeDecodeError:
-        raise ParseError("Could not decode file. Make sure it is a valid UTF-8 text file.")
+        try:
+            text = file_bytes.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            text = file_bytes.decode("latin-1").strip()
 
-    if not text:
-        raise ParseError("File is empty.")
+        if not text:
+            raise ParseError("File is empty.")
 
-    word_count = len(text.split())
+        text = clean_txt_text(text)
 
-    return {
-        "text": text,
-        "metadata": {
-            "file_type": "txt",
-            "page_count": None,
-            "word_count": word_count
+        if not text:
+            raise ParseError("File has no usable content after cleaning.")
+
+        word_count = len(text.split())
+
+        return {
+            "text": text,
+            "metadata": {
+                "file_type": "txt",
+                "page_count": None,
+                "word_count": word_count,
+            },
         }
-    }
+
+    except ParseError:
+        raise
+    except Exception as e:
+        raise ParseError(f"Failed to parse TXT: {e}") from e
