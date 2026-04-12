@@ -118,20 +118,44 @@ export default function App() {
 
           {/* Raw JSON */}
           <h2 style={styles.sectionTitle}>Raw JSON</h2>
-          <button
-            onClick={() => {
-              const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" })
-              const url = URL.createObjectURL(blob)
-              const a = document.createElement("a")
-              a.href = url
-              a.download = `${result.document_id}.json`
-              a.click()
-              URL.revokeObjectURL(url)
-            }}
-            style={styles.downloadBtn}
-          >
-            ⬇ Download JSON
-          </button>
+          {/* Download Buttons */}
+          <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+            <button
+              onClick={() => {
+                const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" })
+                const url = URL.createObjectURL(blob)
+                const a = document.createElement("a")
+                a.href = url
+                a.download = `${result.document_id}.json`
+                a.click()
+                URL.revokeObjectURL(url)
+              }}
+              style={styles.downloadBtn}
+            >
+              ⬇ Download JSON
+            </button>
+
+            <button
+              onClick={async () => {
+                try {
+                  const res = await axios.get(`${API_BASE}/results/${result.document_id}/toml`, {
+                    responseType: "blob"
+                  })
+                  const url = URL.createObjectURL(res.data)
+                  const a = document.createElement("a")
+                  a.href = url
+                  a.download = `${result.document_id}.toml`
+                  a.click()
+                  URL.revokeObjectURL(url)
+                } catch (err) {
+                  alert("Failed to download TOML")
+                }
+              }}
+              style={{ ...styles.downloadBtn, background: "#7c3aed" }}
+            >
+              ⬇ Download TOML
+            </button>
+          </div>
           <pre style={styles.jsonBox}>
             {JSON.stringify(result, null, 2)}
           </pre>

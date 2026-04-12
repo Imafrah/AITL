@@ -3,9 +3,11 @@ import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi.responses import PlainTextResponse
 
 from db.crud import get_document, DBError
 from orchestrator import run_pipeline
+from post_processor.processor import convert_to_toml
 
 router = APIRouter()
 
@@ -75,3 +77,21 @@ def get_result(document_id: str):
             detail="Document not found.")
 
     return doc
+
+
+@router.get("/results/{document_id}/toml", response_class=PlainTextResponse)
+def get_result_toml(document_id: str):
+    try:
+        doc = get_document(document_id)
+    except DBError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    toml_output = convert_to_toml(doc["structured_output"])
+    return PlainTextResponse(
+        content=toml_output,
+        media_type="application/toml",
+        headers={"Content-Disposition": f'attachment; filename="{document_id}.toml"'}
+    )

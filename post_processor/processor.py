@@ -1,3 +1,4 @@
+import json
 import uuid
 from datetime import datetime, timezone
 from thefuzz import fuzz
@@ -272,3 +273,89 @@ def post_process(ai_output: dict, source_file: str, file_metadata: dict) -> dict
 
     except Exception as e:
         raise ValidationError(f"Post-processing failed: {e}")
+
+
+def convert_to_toml(result: dict) -> str:
+    """Convert structured JSON output to TOML format."""
+    lines = []
+
+    # Document info
+    lines.append(f'document_id = "{result.get("document_id", "")}"')
+    lines.append(f'document_type = "{result.get("document_type", "")}"')
+    lines.append(f'source_file = "{result.get("source_file", "")}"')
+    lines.append(f'status = "{result.get("status", "")}"')
+    lines.append(f'error = {json.dumps(result.get("error"))}')
+    lines.append("")
+
+    # Metadata
+    lines.append("[metadata]")
+    metadata = result.get("metadata", {})
+    for key, value in metadata.items():
+        if value is None:
+            lines.append(f'{key} = "null"')
+        elif isinstance(value, str):
+            lines.append(f'{key} = "{value}"')
+        else:
+            lines.append(f'{key} = {value}')
+    lines.append("")
+
+    # Entities
+    entities = result.get("entities", {})
+
+    if entities.get("person_names"):
+        for item in entities["person_names"]:
+            lines.append("[[entities.person_names]]")
+            lines.append(f'id = "{item.get("id", "")}"')
+            lines.append(f'value = "{item.get("value", "")}"')
+            lines.append(f'confidence = {item.get("confidence", 0.0)}')
+            lines.append("")
+
+    if entities.get("organizations"):
+        for item in entities["organizations"]:
+            lines.append("[[entities.organizations]]")
+            lines.append(f'id = "{item.get("id", "")}"')
+            lines.append(f'value = "{item.get("value", "")}"')
+            lines.append(f'confidence = {item.get("confidence", 0.0)}')
+            lines.append("")
+
+    if entities.get("dates"):
+        for item in entities["dates"]:
+            lines.append("[[entities.dates]]")
+            lines.append(f'id = "{item.get("id", "")}"')
+            lines.append(f'value = "{item.get("value", "")}"')
+            if item.get("label"):
+                lines.append(f'label = "{item.get("label", "")}"')
+            lines.append(f'confidence = {item.get("confidence", 0.0)}')
+            lines.append("")
+
+    if entities.get("amounts"):
+        for item in entities["amounts"]:
+            lines.append("[[entities.amounts]]")
+            lines.append(f'id = "{item.get("id", "")}"')
+            lines.append(f'value = {item.get("value", 0)}')
+            lines.append(f'currency = "{item.get("currency", "")}"')
+            lines.append(f'label = "{item.get("label", "")}"')
+            lines.append(f'confidence = {item.get("confidence", 0.0)}')
+            if item.get("flag"):
+                lines.append(f'flag = "{item.get("flag", "")}"')
+            lines.append("")
+
+    if entities.get("payment_methods"):
+        for item in entities["payment_methods"]:
+            lines.append("[[entities.payment_methods]]")
+            lines.append(f'id = "{item.get("id", "")}"')
+            lines.append(f'value = "{item.get("value", "")}"')
+            lines.append(f'confidence = {item.get("confidence", 0.0)}')
+            lines.append("")
+
+    # Relationships
+    if result.get("relationships"):
+        for rel in result["relationships"]:
+            lines.append("[[relationships]]")
+            lines.append(f'type = "{rel.get("type", "")}"')
+            lines.append(f'from = "{rel.get("from", "")}"')
+            lines.append(f'to = "{rel.get("to", "")}"')
+            lines.append(f'confidence = {rel.get("confidence", 0.0)}')
+            lines.append("")
+
+    return "\n".join(lines)
