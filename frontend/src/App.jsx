@@ -149,13 +149,14 @@ export default function App() {
             <button
               onClick={async () => {
                 try {
-                  const res = await axios.get(`${API_BASE}/results/${result.document_id}/toml`, {
-                    responseType: "blob"
+                  // POST avoids DB: CSV and other paths may never persist documents.
+                  const res = await axios.post(`${API_BASE}/export/toml`, result, {
+                    responseType: "blob",
                   })
                   const url = URL.createObjectURL(res.data)
                   const a = document.createElement("a")
                   a.href = url
-                  a.download = `${result.document_id}.toml`
+                  a.download = `${result.document_id ?? "export"}.toml`
                   a.click()
                   URL.revokeObjectURL(url)
                 } catch (err) {

@@ -2,7 +2,7 @@ import os
 import asyncio
 from pathlib import Path
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Body
 from fastapi.responses import PlainTextResponse
 
 from db.crud import get_document, DBError
@@ -63,6 +63,19 @@ async def translate(file: UploadFile = File(...)):
             detail=f"Processing failed: {str(e)}")
 
     return result
+
+
+@router.post("/export/toml", response_class=PlainTextResponse)
+def export_toml(payload: dict = Body(...)):
+    """Convert a structured result dict to TOML without reading the database."""
+    toml_output = convert_to_toml(payload)
+    doc_id = payload.get("document_id") or "export"
+    safe_name = str(doc_id).replace('"', "").replace("\n", "")[:200]
+    return PlainTextResponse(
+        content=toml_output,
+        media_type="application/toml",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.toml"'},
+    )
 
 
 @router.get("/results/{document_id}")

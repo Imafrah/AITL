@@ -7,6 +7,7 @@ export default defineConfig({
     proxy: {
       '/translate': 'http://127.0.0.1:8000',
       '/results': 'http://127.0.0.1:8000',
+      '/export': 'http://127.0.0.1:8000',
     }
   }
 })
