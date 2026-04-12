@@ -378,14 +378,14 @@ class TestOutputModes:
     def test_strict_removes_invalid_email_rows(self):
         """STRICT mode removes rows where any email column is invalid."""
         records = [
-            {"name": "Alice", "email": "alice@test.com", "score": 90},
-            {"name": "Bob", "email": "not-an-email", "score": 85},
-            {"name": "Carol", "email": "carol@test.com", "score": 92},
-            {"name": "Dave", "email": None, "score": 88},
+            {"person_name": "Alice", "email": "alice@test.com", "amount": 90},
+            {"person_name": "Bob", "email": "not-an-email", "amount": 85},
+            {"person_name": "Carol", "email": "carol@test.com", "amount": 92},
+            {"person_name": "Dave", "email": None, "amount": 88},
         ]
         cleaned, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
         # Bob (invalid email) and Dave (null email) should be removed
-        remaining_names = [r.get("name") for r in cleaned]
+        remaining_names = [r.get("person_name") for r in cleaned]
         assert "Bob" not in remaining_names, "Strict should remove invalid email rows"
         assert "Dave" not in remaining_names, "Strict should remove null email rows"
         assert "Alice" in remaining_names
