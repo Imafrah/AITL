@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -891,6 +892,9 @@ def run_final_cleaning_layer(
             r.pop("__imputed__", None)
         working = [_reorder_record_keys(r, [k for k in key_order if k != "__imputed__"]) for r in working]
 
+    if cfg.clean_mode == "strict":
+        working = final_strict_clean(working)
+
     rows_out = len(working)
 
     # ── Measure null rate AFTER cleaning ──
@@ -974,3 +978,78 @@ def write_cleaning_outputs(
     logger.info("Wrote validated output | path=%s", inter_path)
     logger.info("Wrote final cleaned output | path=%s", final_path)
     return {"validated": str(inter_path.resolve()), "final": str(final_path.resolve())}
+
+
+def final_strict_clean(records):
+    if not records:
+        return []
+
+    # 1. Detect field types
+    field_types = {}
+    for key in records[0].keys():
+        values = [r.get(key) for r in records if r.get(key) is not None]
+
+        if not values:
+            continue
+
+        sample = str(values[0])
+
+        if "@" in sample:
+            field_types[key] = "email"
+        elif all(str(v).replace('.', '', 1).isdigit() for v in values):
+            field_types[key] = "numeric"
+        else:
+            field_types[key] = "text"
+
+    # 2. Detect critical fields (dynamic)
+    critical_fields = []
+    for key in records[0].keys():
+        non_null_count = sum(1 for r in records if r.get(key) is not None)
+        if non_null_count / len(records) > 0.7:
+            critical_fields.append(key)
+
+    # 3. Compute medians for numeric fields
+    medians = {}
+    for key, ftype in field_types.items():
+        if ftype == "numeric":
+            nums = [float(r[key]) for r in records if r.get(key) is not None]
+            if nums:
+                medians[key] = statistics.median(nums)
+
+    cleaned = []
+
+    for r in records:
+        new_r = r.copy()
+        remove_row = False
+
+        for key in new_r.keys():
+            val = new_r.get(key)
+            ftype = field_types.get(key)
+
+            # EMAIL FIX
+            if ftype == "email":
+                if val is None or "@" not in str(val):
+                    remove_row = True
+                    break
+
+            # NUMERIC FIX
+            if ftype == "numeric":
+                try:
+                    new_r[key] = float(val)
+                except:
+                    if key in medians:
+                        new_r[key] = medians[key]
+                    else:
+                        remove_row = True
+                        break
+
+        # REMOVE if critical field missing
+        for cf in critical_fields:
+            if new_r.get(cf) is None:
+                remove_row = True
+                break
+
+        if not remove_row:
+            cleaned.append(new_r)
+
+    return cleaned
