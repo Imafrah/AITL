@@ -1,0 +1,16 @@
+{
+  "document_id": "85d37282-60fd-401a-821e-81d50ab41166",
+  "row_count": 1,
+  "data": [
+    {
+      "email": null,
+      "age": 30.0,
+      "person_name": "Alice",
+      "is_valid_email": false,
+      "is_valid_date": true,
+      "is_valid_numeric": true,
+      "confidence": 0.7,
+      "is_anomaly": true
+    }
+  ]
+}

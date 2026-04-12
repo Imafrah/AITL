@@ -5,6 +5,7 @@ row-level universal output.
 
 from __future__ import annotations
 
+import copy
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from core.analytics_engine import compute_analytics
 from core.anomaly_detector import apply_anomaly_detection
 from core.cleaning import build_clean_row, is_valid_email, is_valid_phone, is_valid_salary
 from core.dashboard_formatter import build_dashboard
+from core.final_cleaning import run_final_cleaning_layer, write_cleaning_outputs
 from core.file_router import route_file as classify_file
 from core.intelligence_record import coerce_intelligence_row, dedupe_intelligence_rows
 from core.output_formatter import to_table
@@ -474,22 +476,45 @@ def process_universal(
     if final_status == "failed" and data:
         final_status = "partial"
 
+    cleaned_data, cleaning_stats = run_final_cleaning_layer(
+        data, critical_fields=critical
+    )
+    intermediate_metadata: dict[str, Any] = {
+        "file_type": meta.get("file_type", "unknown"),
+        "row_count": len(data),
+        "processed_at": processed_at,
+        "analytics": analytics,
+        "validation": validation_summary,
+        "critical_fields": critical,
+    }
+    if meta.get("extraction"):
+        intermediate_metadata["extraction"] = meta["extraction"]
+    if meta.get("semantic_map") is not None:
+        intermediate_metadata["semantic_map"] = meta.get("semantic_map")
+    output_paths: dict[str, str] = {}
+    try:
+        output_paths = write_cleaning_outputs(
+            document_id,
+            {"data": copy.deepcopy(data), "metadata": intermediate_metadata},
+            cleaned_data,
+        )
+    except Exception as e:
+        logger.warning("Could not write cleaning output files: %s", e)
+
     envelope: dict[str, Any] = {
         "document_id": document_id,
         "document_type": str(meta.get("document_type", "auto")),
         "status": final_status,
         "data": data,
+        "cleaned_data": cleaned_data,
         "error": meta.get("error"),
         "metadata": {
-            "file_type": meta.get("file_type", "unknown"),
-            "row_count": len(data),
-            "processed_at": processed_at,
-            "analytics": analytics,
-            "validation": validation_summary,
+            **intermediate_metadata,
+            "final_cleaning": cleaning_stats,
+            "cleaned_row_count": len(cleaned_data),
+            "output_paths": output_paths,
         },
     }
-    if meta.get("extraction"):
-        envelope["metadata"]["extraction"] = meta["extraction"]
     if output_format == "table":
         envelope["table"] = to_table(data)
     elif output_format == "dashboard":
