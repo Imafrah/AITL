@@ -510,6 +510,7 @@ def process_universal(
                 "metadata": intermediate_metadata,
             },
             cleaned_data,
+            cleaning_stats=cleaning_stats,
         )
     except Exception as e:
         logger.warning("Could not write cleaning output files: %s", e)

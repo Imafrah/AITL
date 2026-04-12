@@ -4,7 +4,10 @@ Final cleaning layer — dataset-agnostic, conservative ETL-style repair.
 Policy is driven by :class:`CleaningConfig` (environment variables), including
 clean mode (``safe`` / ``strict``), email handling (``none`` / ``remove_row`` / ``placeholder``),
 optional text sentinels, median imputation thresholds, and optional ``__imputed__`` lineage.
-Never bulk-fills phone-like or near-unique identifier columns.
+Never bulk-fills phone-like, ID-like, or near-unique identifier columns.
+
+Imputation lineage records the *method* used (``median``, ``placeholder``,
+``text_placeholder``) so every filled value is explainable.
 """
 
 from __future__ import annotations
@@ -293,10 +296,10 @@ def detect_field_types(records: list[dict[str, Any]]) -> dict[str, set[str]]:
     """
     Classify columns from **value patterns** (digits, ``@``, parseability), not dataset names.
 
-    Returns ``{"numeric": set(...), "email": set(...), "text": set(...)}``.
+    Returns ``{"numeric": set(...), "email": set(...), "date": set(...), "text": set(...)}``.
     Each non-reserved key appears in exactly one bucket.
     """
-    out: dict[str, set[str]] = {"numeric": set(), "email": set(), "text": set()}
+    out: dict[str, set[str]] = {"numeric": set(), "email": set(), "date": set(), "text": set()}
     if not records:
         return out
 
@@ -315,6 +318,7 @@ def detect_field_types(records: list[dict[str, Any]]) -> dict[str, set[str]]:
         at_like = 0
         valid_email_n = 0
         num_ok = 0
+        date_ok = 0
 
         for r in records:
             v = r.get(k)
@@ -328,6 +332,9 @@ def detect_field_types(records: list[dict[str, Any]]) -> dict[str, set[str]]:
                     at_like += 1
                 if is_valid_email(sv):
                     valid_email_n += 1
+                # Check if the string parses as a date
+                if is_valid_date(sv):
+                    date_ok += 1
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 num_ok += 1
             elif isinstance(v, str):
@@ -344,10 +351,24 @@ def detect_field_types(records: list[dict[str, Any]]) -> dict[str, set[str]]:
         email_ratio = at_like / filled
         valid_email_ratio = valid_email_n / filled
         num_ratio = num_ok / filled
+        date_ratio = date_ok / filled
 
         # Email: many cells look like addresses (``@`` + TLD) or mostly valid emails
         if email_ratio >= 0.35 or valid_email_ratio >= 0.25:
             out["email"].add(k)
+            continue
+
+        # Date: ≥40% of filled values parse as dates AND the column key hints at temporal
+        # data OR ≥60% parse as dates regardless of name. Never classify a mostly-numeric
+        # column as date (pure integers like 2024 can parse as dates).
+        nk = normalize_field_name(k)
+        date_name_hint = any(
+            x in nk for x in ("date", "dob", "birth", "timestamp", "created", "updated", "joined", "hired")
+        )
+        if num_ratio < 0.5 and (
+            (date_ratio >= 0.40 and date_name_hint) or date_ratio >= 0.60
+        ):
+            out["date"].add(k)
             continue
 
         # Single-row inputs: infer from the present cell(s) using the same signals.
@@ -391,6 +412,46 @@ def _detect_phone_like_columns(records: list[dict[str, Any]], keys: Iterable[str
             if 10 <= len(digits) <= 15 and len(digits) >= len(v) * 0.45:
                 hit += 1
         if hit / len(filled) >= 0.5:
+            out.add(k)
+    return out
+
+
+def _detect_id_like_text_columns(
+    records: list[dict[str, Any]], text_keys: Iterable[str]
+) -> set[str]:
+    """
+    Text columns that are identifier-like (UUID, serial, reference, code) or
+    near-unique — never filled with text placeholders. Detection is purely
+    pattern-based (column name heuristics + cardinality), no dataset-specific rules.
+    """
+    _ID_FRAGMENTS = (
+        "id", "uuid", "ref", "reference", "key", "code", "serial",
+        "number", "num", "no", "identifier", "index", "idx", "ticket",
+        "order", "account", "invoice", "sku", "barcode", "ssn", "passport",
+    )
+    # Not "phone_number" — those are handled by _detect_phone_like_columns.
+    _EXCLUDE_FRAGMENTS = ("phone", "tel", "mobile", "cell", "fax")
+    out: set[str] = set()
+    for k in text_keys:
+        nk = normalize_field_name(k)
+        if not nk:
+            continue
+        # Skip phone-like column names
+        if any(x in nk for x in _EXCLUDE_FRAGMENTS):
+            continue
+        # Name-based: key contains an ID-like fragment
+        name_hit = any(x in nk for x in _ID_FRAGMENTS)
+        # Cardinality-based: ≥90% unique values when enough data
+        filled_vals: list[str] = []
+        for r in records:
+            v = r.get(k)
+            if _is_present(v):
+                filled_vals.append(str(v).strip().lower())
+        if not filled_vals:
+            continue
+        distinct_ratio = len(set(filled_vals)) / len(filled_vals) if filled_vals else 0
+        high_cardinality = len(filled_vals) >= 5 and distinct_ratio >= 0.90
+        if name_hit or high_cardinality:
             out.add(k)
     return out
 
@@ -478,14 +539,36 @@ def _normalize_strings_inplace(record: dict[str, Any]) -> None:
                 record[k] = s
 
 
-def _refresh_validation_flags(record: dict[str, Any]) -> None:
-    em = record.get("email")
-    record["is_valid_email"] = bool(em and is_valid_email(em))
-    dt = record.get("date")
-    if dt is not None and str(dt).strip():
-        record["is_valid_date"] = is_valid_date(dt)
-    else:
-        record["is_valid_date"] = True
+def _refresh_validation_flags(
+    record: dict[str, Any],
+    email_cols: set[str] | None = None,
+    date_cols: set[str] | None = None,
+) -> None:
+    """Recompute validation booleans using dynamically detected column sets."""
+    # Email validation — check ALL detected email columns, not just "email"
+    e_cols = email_cols or {"email"}
+    any_email_valid = False
+    any_email_present = False
+    for ek in e_cols:
+        em = record.get(ek)
+        if em and str(em).strip():
+            any_email_present = True
+            if is_valid_email(str(em)):
+                any_email_valid = True
+    record["is_valid_email"] = any_email_valid if any_email_present else True
+
+    # Date validation — check ALL detected date columns, not just "date"
+    d_cols = date_cols or {"date"}
+    any_date_invalid = False
+    any_date_present = False
+    for dk in d_cols:
+        dt = record.get(dk)
+        if dt is not None and str(dt).strip():
+            any_date_present = True
+            if not is_valid_date(dt):
+                any_date_invalid = True
+    record["is_valid_date"] = not any_date_invalid if any_date_present else True
+
     record["is_valid_numeric"] = validate_row_numeric_aggregate(record)
 
 
@@ -495,6 +578,21 @@ def _missing_ratio(record: dict[str, Any], schema_keys: list[str]) -> float:
         return 0.0
     missing = sum(1 for k in denom_keys if not _is_present(record.get(k)))
     return missing / len(denom_keys)
+
+
+def _compute_null_rate(records: list[dict[str, Any]], schema_keys: list[str]) -> float:
+    """Fraction of ``None``/empty cells across the entire dataset (excluding reserved keys)."""
+    denom_keys = [k for k in schema_keys if k not in _RATIO_EXCLUDED_KEYS]
+    if not denom_keys or not records:
+        return 0.0
+    total = len(denom_keys) * len(records)
+    missing = sum(
+        1
+        for r in records
+        for k in denom_keys
+        if not _is_present(r.get(k))
+    )
+    return round(missing / total, 6) if total else 0.0
 
 
 def _dedupe_identical_rows(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
@@ -516,8 +614,8 @@ def run_final_cleaning_layer(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
     Production pass on a **copy** of rows: conservative imputation, optional email policy,
-    no synthetic IDs/phones, optional ``__imputed__`` lineage. ``config`` defaults to
-    :meth:`CleaningConfig.from_env`.
+    no synthetic IDs/phones, optional ``__imputed__`` lineage with method tags.
+    ``config`` defaults to :meth:`CleaningConfig.from_env`.
     """
     cfg = config or CleaningConfig.from_env()
     rows_in = len(records)
@@ -530,11 +628,15 @@ def run_final_cleaning_layer(
         "missing_values_filled": False,
         "low_quality_removed": 0,
         "duplicate_rows_removed": 0,
-        "field_types": {"numeric": [], "email": [], "text": []},
+        "field_types": {"numeric": [], "email": [], "date": [], "text": []},
         "cleaning_summary": {
             "rows_removed": 0,
             "values_filled": 0,
             "invalid_values_fixed": 0,
+            "null_rate_before": 0.0,
+            "null_rate_after": 0.0,
+            "schema_field_count": 0,
+            "quality_score": 1.0,
         },
     }
     if not records:
@@ -552,14 +654,19 @@ def run_final_cleaning_layer(
     schema_keys = list(working[0].keys())
     missing_threshold = 0.25 if cfg.clean_mode == "strict" else 0.5
 
+    # ── Measure null rate BEFORE cleaning ──
+    null_rate_before = _compute_null_rate(working, schema_keys)
+
     field_types = detect_field_types(working)
     stats["field_types"] = {
         "numeric": sorted(field_types["numeric"]),
         "email": sorted(field_types["email"]),
+        "date": sorted(field_types.get("date", set())),
         "text": sorted(field_types["text"]),
     }
     numeric_cols = set(field_types["numeric"])
     email_cols = set(field_types["email"])
+    date_cols = set(field_types.get("date", set()))
     text_cols = set(field_types["text"])
 
     content_keys = [
@@ -568,10 +675,15 @@ def run_final_cleaning_layer(
         if k not in _RESERVED_KEYS and k not in _INTERNAL_KEYS and not str(k).startswith("__")
     ]
     phone_like = _detect_phone_like_columns(working, content_keys)
+    id_like_text = _detect_id_like_text_columns(working, text_cols)
+
     # Digit-heavy strings (phones) must not be classified or coerced as plain numbers.
     for k in phone_like & numeric_cols:
         numeric_cols.remove(k)
         text_cols.add(k)
+    # Date columns must not be coerced as numbers
+    for k in date_cols & numeric_cols:
+        numeric_cols.remove(k)
 
     invalid_fixed_cells = 0
     invalid_changed = False
@@ -587,6 +699,20 @@ def run_final_cleaning_layer(
                     invalid_changed = True
                     if cfg.email_invalid_strategy != "placeholder":
                         invalid_fixed_cells += 1
+            elif k in date_cols:
+                # Normalize valid dates to ISO, null out unparseable ones
+                if v is not None and str(v).strip():
+                    iso = normalize_date_value(v)
+                    if iso:
+                        if str(v).strip() != iso:
+                            invalid_fixed_cells += 1
+                        r[k] = iso
+                    else:
+                        r[k] = None
+                        invalid_changed = True
+                        invalid_fixed_cells += 1
+                else:
+                    r[k] = None
             elif k in numeric_cols:
                 if v is None or (isinstance(v, str) and not str(v).strip()):
                     r[k] = None
@@ -613,6 +739,9 @@ def run_final_cleaning_layer(
                 if not _is_present(r.get(k)):
                     r[k] = cfg.email_placeholder
                     invalid_fixed_cells += 1
+                    if cfg.track_imputation:
+                        im = r.setdefault("__imputed__", {})
+                        im[k] = "placeholder"
 
     values_filled_cells = 0
     text_ph_cells = 0
@@ -639,7 +768,7 @@ def run_final_cleaning_layer(
                 values_filled_cells += 1
                 if cfg.track_imputation:
                     im = r.setdefault("__imputed__", {})
-                    im[k] = True
+                    im[k] = "median"
 
     before_filter = len(working)
     kept: list[dict[str, Any]] = []
@@ -666,13 +795,17 @@ def run_final_cleaning_layer(
         _normalize_strings_inplace(r)
         if cfg.text_missing_placeholder and text_cols:
             for k in text_cols:
-                if k in phone_like | email_cols:
+                # Never fill phone-like, email, or ID-like text columns with placeholders
+                if k in phone_like | email_cols | id_like_text:
                     continue
                 if not _is_present(r.get(k)):
                     r[k] = cfg.text_missing_placeholder
                     text_ph_cells += 1
                     values_filled_cells += 1
-        _refresh_validation_flags(r)
+                    if cfg.track_imputation:
+                        im = r.setdefault("__imputed__", {})
+                        im[k] = "text_placeholder"
+        _refresh_validation_flags(r, email_cols=email_cols, date_cols=date_cols)
         r["is_anomaly"] = False
 
     if filled_any or text_ph_cells:
@@ -702,12 +835,39 @@ def run_final_cleaning_layer(
         working = [_reorder_record_keys(r, [k for k in key_order if k != "__imputed__"]) for r in working]
 
     rows_out = len(working)
+
+    # ── Measure null rate AFTER cleaning ──
+    final_schema_keys = list(working[0].keys()) if working else schema_keys
+    null_rate_after = _compute_null_rate(working, final_schema_keys)
+    content_field_count = len(
+        [k for k in final_schema_keys if k not in _RATIO_EXCLUDED_KEYS]
+    )
+
+    # ── Compute quality score (0.0–1.0) ──
+    # Penalize for: remaining nulls, removed rows, invalid values found
+    q = 1.0
+    if null_rate_after > 0:
+        q -= min(null_rate_after * 0.5, 0.25)  # up to -0.25 for nulls
+    if rows_in > 0:
+        removal_ratio = (rows_in - rows_out) / rows_in
+        q -= min(removal_ratio * 0.3, 0.15)  # up to -0.15 for row removal
+    if invalid_fixed_cells > 0 and rows_in > 0:
+        invalid_ratio = invalid_fixed_cells / max(rows_in * content_field_count, 1)
+        q -= min(invalid_ratio * 0.5, 0.20)  # up to -0.20 for invalids
+    quality_score = round(max(0.0, min(1.0, q)), 4)
+
     stats["invalid_values_replaced"] = invalid_changed
     stats["rows_out"] = rows_out
+    stats["id_like_text_columns"] = sorted(id_like_text)
+    stats["phone_like_columns"] = sorted(phone_like)
     stats["cleaning_summary"] = {
         "rows_removed": rows_in - rows_out,
         "values_filled": values_filled_cells,
         "invalid_values_fixed": invalid_fixed_cells,
+        "null_rate_before": null_rate_before,
+        "null_rate_after": null_rate_after,
+        "schema_field_count": content_field_count,
+        "quality_score": quality_score,
     }
     return working, stats
 
@@ -717,11 +877,13 @@ def write_cleaning_outputs(
     validated_payload: dict[str, Any],
     final_rows: list[dict[str, Any]],
     *,
+    cleaning_stats: dict[str, Any] | None = None,
     output_dir: str | os.PathLike[str] | None = None,
 ) -> dict[str, str]:
     """
     Write ``validated_output.json`` (flags + anomalies) and
-    ``final_cleaned_output.json`` (production rows). Returns paths written.
+    ``final_cleaned_output.json`` (production rows + cleaning summary).
+    Returns paths written.
     """
     root = Path(output_dir or os.getenv("AITL_OUTPUT_DIR", "output"))
     safe_id = str(document_id).replace("..", "").replace("/", "_").replace("\\", "_")[:200]
@@ -739,11 +901,15 @@ def write_cleaning_outputs(
         json.dumps(inter_body, indent=2, default=str, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    final_body = {
+    final_body: dict[str, Any] = {
         "document_id": document_id,
         "row_count": len(final_rows),
         "final_cleaned_output": final_rows,
     }
+    # Include cleaning summary so the output file is self-contained and analysis-ready
+    if cleaning_stats:
+        final_body["cleaning_summary"] = cleaning_stats.get("cleaning_summary", {})
+        final_body["field_types"] = cleaning_stats.get("field_types", {})
     final_path.write_text(
         json.dumps(final_body, indent=2, default=str, ensure_ascii=False) + "\n",
         encoding="utf-8",
