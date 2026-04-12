@@ -1,6 +1,6 @@
 import csv
 import io
-import uuid
+import re
 import logging
 
 import pandas as pd
@@ -9,6 +9,279 @@ from parsers.txt_parser import ParseError
 from utils.data_cleaner import clean_csv_row, clean_csv_text_output, get_cleaning_stats
 
 logger = logging.getLogger("csv_parser")
+
+
+def normalize_field_name(s: str | None) -> str:
+    """Lowercase, trim, strip BOM, collapse spaces/underscores for header matching."""
+    if s is None:
+        return ""
+    t = str(s).strip().lower().replace("\ufeff", "")
+    t = re.sub(r"[\s_\-]+", "_", t)
+    return t.strip("_")
+
+
+# --- Canonical keys expected by process_*_row (original casing) ---
+
+_TRANSACTION_ALIASES: dict[str, str] = {
+    "transaction_id": "Transaction_ID",
+    "trans_id": "Transaction_ID",
+    "txn_id": "Transaction_ID",
+    "txn": "Transaction_ID",
+    "order_id": "Transaction_ID",
+    "invoice_id": "Transaction_ID",
+    "customer_id": "Customer_ID",
+    "customer": "Customer_ID",
+    "client_id": "Customer_ID",
+    "client": "Customer_ID",
+    "buyer": "Customer_ID",
+    "customer_name": "Customer_ID",
+    "payer": "Customer_ID",
+    "payment_method": "Payment_Method",
+    "pay_method": "Payment_Method",
+    "payment_type": "Payment_Method",
+    "method": "Payment_Method",
+    "pay_mode": "Payment_Method",
+    "price": "Price",
+    "amount": "Price",
+    "total": "Price",
+    "value": "Price",
+    "cost": "Price",
+    "payment": "Price",
+    "grand_total": "Price",
+    "transaction_date": "Transaction_Date",
+    "date": "Transaction_Date",
+    "paid_date": "Transaction_Date",
+    "order_date": "Transaction_Date",
+    "transaction_status": "Transaction_Status",
+    "status": "Transaction_Status",
+    "state": "Transaction_Status",
+}
+
+_EMPLOYEE_ALIASES: dict[str, str] = {
+    "employee_id": "Employee_ID",
+    "emp_id": "Employee_ID",
+    "emp_no": "Employee_ID",
+    "staff_id": "Employee_ID",
+    "name": "Name",
+    "full_name": "Name",
+    "employee_name": "Name",
+    "emp_name": "Name",
+    "first_name": "Name",
+    "department": "Department",
+    "dept": "Department",
+    "division": "Department",
+    "team": "Department",
+    "salary": "Salary",
+    "wage": "Salary",
+    "pay": "Salary",
+    "compensation": "Salary",
+    "annual_salary": "Salary",
+    "base_salary": "Salary",
+}
+
+_SALES_ALIASES: dict[str, str] = {
+    "vendor": "vendor",
+    "supplier": "vendor",
+    "merchant": "vendor",
+    "seller": "vendor",
+    "amount": "amount",
+    "total": "amount",
+    "price": "amount",
+    "value": "amount",
+    "currency": "currency",
+    "curr": "currency",
+    "date": "date",
+    "sale_date": "date",
+    "invoice_date": "date",
+}
+
+
+def _apply_aliases(row: dict, alias_map: dict[str, str]) -> dict:
+    """Copy row and fill canonical keys from any column whose normalized name matches."""
+    out = dict(row)
+    for orig_k, v in row.items():
+        nk = normalize_field_name(orig_k)
+        canon = alias_map.get(nk)
+        if canon is None:
+            continue
+        if v in (None, ""):
+            continue
+        if out.get(canon) in (None, ""):
+            out[canon] = v
+    return out
+
+
+def _detect_csv_schema(fieldnames: list[str]) -> str:
+    """
+    Pick transaction | employee | sales | generic from headers (case/spacing tolerant).
+    Order matters: transaction before employee to avoid invoice+total false positives.
+    """
+    norms = {normalize_field_name(f) for f in fieldnames if f is not None and str(f).strip()}
+
+    def has_any(keys: set[str]) -> bool:
+        return bool(norms & keys)
+
+    name_h = {"name", "full_name", "employee_name", "emp_name", "first_name", "last_name"}
+    dept_h = {"department", "dept", "division", "team"}
+    sal_h = {"salary", "wage", "compensation", "annual_salary", "base_salary"}
+    emp_id_h = {"employee_id", "emp_id", "emp_no", "staff_id"}
+    txn_h = {
+        "transaction_id",
+        "trans_id",
+        "txn_id",
+        "txn",
+        "order_id",
+        "invoice_id",
+    }
+    pay_h = {"payment_method", "pay_method", "payment_type", "pay_mode"}
+    # "method" alone is weak; "payment" as column often means amount column name
+    price_h = {"price", "amount", "total", "value", "cost", "grand_total", "subtotal", "payment"}
+    cust_h = {"customer_id", "customer", "client_id", "client", "buyer", "payer", "customer_name"}
+    ven_h = {"vendor", "supplier", "merchant", "seller"}
+
+    # Transactions / invoices
+    if (has_any(pay_h) and has_any(price_h)) or (
+        has_any(txn_h) and (has_any(pay_h) or has_any(price_h))
+    ):
+        return "transaction"
+    if has_any(cust_h) and has_any(price_h):
+        return "transaction"
+
+    # HR-style rows (avoid matching on generic "pay" — use compensation keywords)
+    sal_strict = {"salary", "wage", "compensation", "annual_salary", "base_salary"}
+    if (has_any(name_h) or has_any(emp_id_h)) and (has_any(dept_h) or has_any(sal_strict)):
+        return "employee"
+
+    # Sales extract
+    if has_any(ven_h) and has_any(price_h):
+        return "sales"
+
+    return "generic"
+
+
+_AMOUNT_HINTS = (
+    "price",
+    "amount",
+    "total",
+    "salary",
+    "wage",
+    "cost",
+    "fee",
+    "qty",
+    "quantity",
+    "balance",
+    "revenue",
+    "tax",
+    "discount",
+    "subtotal",
+    "msrp",
+    "rrp",
+    "rate",
+    "unit_price",
+    "net",
+    "gross",
+)
+
+_SKIP_AMOUNT_COL = frozenset({"id", "index", "row", "line", "version", "year", "month", "zip", "pin"})
+
+
+def process_generic_tabular_row(row: dict, row_index: int) -> dict:
+    """Best-effort extraction for arbitrary CSV columns (no fixed schema)."""
+    parts = [str(v).strip() for v in list(row.values())[:3] if v not in (None, "")]
+    slug = re.sub(r"[^\w\-]+", "_", "_".join(parts))[:56].strip("_") or f"r{row_index}"
+    doc_id = f"row-{slug}"
+
+    entities: dict = {"person_names": [], "organizations": [], "dates": [], "amounts": []}
+    extra_fields: dict = {}
+    pid = oid = did = aid = 0
+
+    for orig_k, v in row.items():
+        if v is None:
+            continue
+        sval = str(v).strip()
+        if not sval:
+            continue
+        nk = normalize_field_name(orig_k)
+
+        num = safe_float(sval)
+        if num is not None and nk not in _SKIP_AMOUNT_COL:
+            if any(h in nk for h in _AMOUNT_HINTS):
+                aid += 1
+                entities["amounts"].append(
+                    {
+                        "id": f"a{aid}",
+                        "value": num,
+                        "currency": "USD",
+                        "label": nk or "amount",
+                        "confidence": 0.82,
+                    }
+                )
+                continue
+
+        if any(x in nk for x in ("date", "time", "timestamp")) and len(sval) >= 6:
+            did += 1
+            entities["dates"].append({"id": f"d{did}", "value": sval, "confidence": 0.72})
+            continue
+
+        if any(
+            x in nk
+            for x in (
+                "name",
+                "person",
+                "user",
+                "customer",
+                "client",
+                "employee",
+                "owner",
+                "author",
+            )
+        ):
+            pid += 1
+            entities["person_names"].append({"id": f"p{pid}", "value": sval, "confidence": 0.78})
+            continue
+
+        if any(
+            x in nk
+            for x in (
+                "org",
+                "company",
+                "vendor",
+                "dept",
+                "department",
+                "division",
+                "team",
+                "merchant",
+                "supplier",
+                "store",
+                "brand",
+                "city",
+                "country",
+                "region",
+            )
+        ):
+            oid += 1
+            entities["organizations"].append({"id": f"o{oid}", "value": sval, "confidence": 0.74})
+            continue
+
+        extra_fields[str(orig_k)] = v
+
+    has_entities = any(entities[k] for k in entities)
+    status = "success" if (has_entities or extra_fields) else "partial"
+    err = None if status == "success" else "No extractable fields; see metadata.extra_fields for raw cells."
+
+    meta = {"file_type": "csv", "columns": list(row.keys())}
+    if extra_fields:
+        meta["extra_fields"] = extra_fields
+
+    return {
+        "document_id": doc_id,
+        "document_type": "generic_csv",
+        "status": status,
+        "error": err,
+        "entities": entities,
+        "relationships": [],
+        "metadata": meta,
+    }
 
 def normalize_payment(method: str) -> str:
     """Normalize payment method strings."""
@@ -246,14 +519,10 @@ def parse_csv_documents(file_bytes: bytes) -> list[dict]:
         content = file_bytes.decode("latin-1")
 
     reader = csv.DictReader(io.StringIO(content))
-    fieldnames = reader.fieldnames or []
-
-    is_transaction = any(
-        k in fieldnames
-        for k in ["Transaction_ID", "Payment_Method", "Transaction_Status", "Customer_ID"]
-    )
-    is_employee = any(k in fieldnames for k in ["Employee_ID", "Department", "Salary", "Name"])
-    is_sales = any(k in fieldnames for k in ["vendor", "amount"])
+    raw_headers = reader.fieldnames or []
+    fieldnames = [str(f).strip() for f in raw_headers if f is not None and str(f).strip()]
+    schema = _detect_csv_schema(fieldnames)
+    logger.info("CSV schema=%s | headers=%s", schema, fieldnames)
 
     results = []
     MAX_ROWS = 1000
@@ -269,27 +538,14 @@ def parse_csv_documents(file_bytes: bytes) -> list[dict]:
         row = clean_csv_row(dict(row))
 
         try:
-            if is_transaction:
-                doc = process_transaction_row(row, idx + 1)
-            elif is_employee:
-                doc = process_employee_row(row, idx + 1)
-            elif is_sales:
-                doc = process_sales_row(row, idx + 1)
+            if schema == "transaction":
+                doc = process_transaction_row(_apply_aliases(row, _TRANSACTION_ALIASES), idx + 1)
+            elif schema == "employee":
+                doc = process_employee_row(_apply_aliases(row, _EMPLOYEE_ALIASES), idx + 1)
+            elif schema == "sales":
+                doc = process_sales_row(_apply_aliases(row, _SALES_ALIASES), idx + 1)
             else:
-                doc = {
-                    "document_id": f"row-{uuid.uuid4()}",
-                    "document_type": "unknown_csv",
-                    "status": "partial",
-                    "error": "Unrecognized CSV schema format.",
-                    "entities": {
-                        "person_names": [],
-                        "organizations": [],
-                        "dates": [],
-                        "amounts": [],
-                    },
-                    "relationships": [],
-                    "metadata": {"file_type": "csv"},
-                }
+                doc = process_generic_tabular_row(row, idx + 1)
             results.append(doc)
 
         except Exception as e:
