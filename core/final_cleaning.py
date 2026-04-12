@@ -990,21 +990,37 @@ import collections
 import statistics
 from typing import Any
 
+def _clean_text_noise(text: str) -> str:
+    """Removes brackets, parentheses, and citation markers like † ‡ * from strings."""
+    # Strip everything inside [] or ()
+    t = re.sub(r'\[.*?\]', '', text)
+    t = re.sub(r'\(.*?\)', '', t)
+    # Strip specific garbage characters
+    t = re.sub(r'[†‡\*^]', '', t)
+    return t.strip()
+
 def dynamic_adaptive_cleaning(records: list[dict[str, Any]], critical_fields: list[str]) -> list[dict[str, Any]]:
     """Fully dynamic cleaner: detects noise, infers types, imputes via median/mode, drops missing criticals."""
     if not records:
         return []
 
+    # 0. Deep pre-clean string noises so that '1[4]' correctly becomes '1' and infers to Numeric
+    for r in records:
+        for k, v in r.items():
+            if isinstance(v, str):
+                r[k] = _clean_text_noise(v)
+
     # 1. Strip validation noise
     noise_prefixes = ("is_", "confidence")
     noise_suffixes = ("_score",)
+    noise_exact = ("ref", "references", "annotation", "notes")
     
     schema_keys = set()
     for r in records:
         for k in r.keys():
             k_lower = k.lower()
             if not k_lower.startswith(noise_prefixes) and not k_lower.endswith(noise_suffixes):
-                if k != "__imputed__":
+                if k_lower not in noise_exact and k != "__imputed__":
                     schema_keys.add(k)
                 
     schema_keys_list = sorted(list(schema_keys))
