@@ -273,8 +273,43 @@ def post_process(ai_output: dict, source_file: str, file_metadata: dict) -> dict
         raise ValidationError(f"Post-processing failed: {e}")
 
 
+def _convert_universal_envelope_to_toml(result: dict) -> str:
+    """Universal envelope: document_id, type, status, metadata, [[data]] rows."""
+    lines = []
+    lines.append(f'document_id = "{result.get("document_id", "")}"')
+    lines.append(f'document_type = "{result.get("document_type", "")}"')
+    lines.append(f'status = "{result.get("status", "")}"')
+    lines.append(f'error = {json.dumps(result.get("error"))}')
+    lines.append("")
+    lines.append("[metadata]")
+    for key, value in (result.get("metadata") or {}).items():
+        if value is None:
+            lines.append(f'{key} = "null"')
+        elif isinstance(value, str):
+            lines.append(f'{key} = "{value}"')
+        else:
+            lines.append(f"{key} = {json.dumps(value)}")
+    lines.append("")
+    for row in result.get("data") or []:
+        lines.append("[[data]]")
+        for k, v in row.items():
+            if v is None:
+                lines.append(f"{k} = null")
+            elif isinstance(v, bool):
+                lines.append(f"{k} = {str(v).lower()}")
+            elif isinstance(v, (int, float)):
+                lines.append(f"{k} = {v}")
+            else:
+                lines.append(f'{k} = {json.dumps(str(v))}')
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def convert_to_toml(result: dict) -> str:
     """Convert structured JSON output to TOML format."""
+    if isinstance(result.get("data"), list) and "entities" not in result:
+        return _convert_universal_envelope_to_toml(result)
+
     lines = []
 
     # Document info

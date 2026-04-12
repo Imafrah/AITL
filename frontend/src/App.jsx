@@ -11,6 +11,7 @@ export default function App() {
   const [result, setResult] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+  const [responseFormat, setResponseFormat] = useState("json")
 
   const handleUpload = async () => {
     if (!file) return
@@ -22,19 +23,25 @@ export default function App() {
     formData.append("file", file)
 
     try {
-      const res = await axios.post(`${API_BASE}/translate`, formData)
-      const data = res.data
-      // CSV pipeline returns an array of documents; UI expects one object.
-      if (Array.isArray(data)) {
-        if (data.length === 0) {
-          setError("No documents returned from CSV.")
-          setResult(null)
-        } else {
-          setResult(data[0])
-        }
-      } else {
-        setResult(data)
+      if (responseFormat === "csv") {
+        const res = await axios.post(`${API_BASE}/translate`, formData, {
+          params: { format: "csv" },
+          responseType: "blob",
+        })
+        const url = URL.createObjectURL(res.data)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = `${(file.name || "export").replace(/\.[^.]+$/, "")}.csv`
+        a.click()
+        URL.revokeObjectURL(url)
+        setResult(null)
+        return
       }
+
+      const res = await axios.post(`${API_BASE}/translate`, formData, {
+        params: { format: responseFormat },
+      })
+      setResult(res.data)
     } catch (err) {
       setError(err.response?.data?.detail || "Something went wrong.")
     } finally {
@@ -42,12 +49,14 @@ export default function App() {
     }
   }
 
+  const rows = result?.data
+  const hasUniversalEnvelope = Boolean(result?.document_id && Array.isArray(rows))
+
   return (
     <div style={styles.container}>
       <h1 style={styles.title}>🧠 AITL</h1>
-      <p style={styles.subtitle}>AI Data Translation Layer</p>
+      <p style={styles.subtitle}>Universal File Intelligence Engine</p>
 
-      {/* Upload Box */}
       <div style={styles.uploadBox}>
         <input
           type="file"
@@ -56,27 +65,35 @@ export default function App() {
           style={styles.fileInput}
         />
         {file && <p style={styles.fileName}>📄 {file.name}</p>}
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ color: "#94a3b8", fontSize: 14, marginRight: 8 }}>Response</label>
+          <select
+            value={responseFormat}
+            onChange={(e) => setResponseFormat(e.target.value)}
+            style={styles.select}
+          >
+            <option value="json">JSON (full envelope)</option>
+            <option value="table">JSON + flattened table</option>
+            <option value="csv">Download CSV</option>
+          </select>
+        </div>
         <button
           onClick={handleUpload}
           disabled={!file || loading}
           style={styles.button}
         >
-          {loading ? "Processing..." : "Translate Document"}
+          {loading ? "Processing..." : "Process file"}
         </button>
       </div>
 
-      {/* Error */}
       {error && (
         <div style={styles.errorBox}>
           ❌ {error}
         </div>
       )}
 
-      {/* Results */}
-      {result && typeof result === "object" && !Array.isArray(result) && (
+      {result && typeof result === "object" && !Array.isArray(result) && hasUniversalEnvelope && (
         <div style={styles.resultContainer}>
-
-          {/* Status Badge */}
           <div style={styles.statusRow}>
             <span style={{
               ...styles.badge,
@@ -86,37 +103,25 @@ export default function App() {
               {String(result.status ?? "unknown").toUpperCase()}
             </span>
             <span style={styles.docId}>ID: {result.document_id}</span>
+            <span style={styles.docId}>Type: {result.document_type}</span>
           </div>
 
-          {/* Entity Cards */}
-          <h2 style={styles.sectionTitle}>Entities</h2>
-          <div style={styles.cardGrid}>
-            <EntityGroup label="👤 People" items={result.entities?.person_names} color="#3b82f6" />
-            <EntityGroup label="🏢 Organizations" items={result.entities?.organizations} color="#8b5cf6" />
-            <EntityGroup label="📅 Dates" items={result.entities?.dates} color="#06b6d4" />
-            <EntityGroup label="💰 Amounts" items={result.entities?.amounts} color="#22c55e" />
-          </div>
+          {result.error && (
+            <div style={{ ...styles.errorBox, marginTop: 12 }}>
+              {String(result.error)}
+            </div>
+          )}
 
-          {/* Relationships */}
-          {result.relationships?.length > 0 && (
+          <h2 style={styles.sectionTitle}>Data ({rows.length} rows)</h2>
+          <DataPreview rows={rows} />
+
+          {result.table && (
             <>
-              <h2 style={styles.sectionTitle}>Relationships</h2>
-              <div style={styles.relBox}>
-                {result.relationships.map((rel, i) => (
-                  <div key={i} style={styles.relRow}>
-                    <span style={styles.relTag}>{rel.from}</span>
-                    <span style={styles.relArrow}>→ {rel.type} →</span>
-                    <span style={styles.relTag}>{rel.to}</span>
-                    <span style={styles.confidence}>
-                      {((rel.confidence ?? 0) * 100).toFixed(0)}%
-                    </span>
-                  </div>
-                ))}
-              </div>
+              <h2 style={styles.sectionTitle}>Flattened table</h2>
+              <DataPreview rows={result.table} />
             </>
           )}
 
-          {/* Metadata */}
           <h2 style={styles.sectionTitle}>Metadata</h2>
           <div style={styles.metaBox}>
             {Object.entries(result.metadata || {}).map(([k, v]) => (
@@ -127,10 +132,8 @@ export default function App() {
             ))}
           </div>
 
-          {/* Raw JSON */}
           <h2 style={styles.sectionTitle}>Raw JSON</h2>
-          {/* Download Buttons */}
-          <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+          <div style={{ display: "flex", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
             <button
               onClick={() => {
                 const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" })
@@ -145,11 +148,9 @@ export default function App() {
             >
               ⬇ Download JSON
             </button>
-
             <button
               onClick={async () => {
                 try {
-                  // POST avoids DB: CSV and other paths may never persist documents.
                   const res = await axios.post(`${API_BASE}/export/toml`, result, {
                     responseType: "blob",
                   })
@@ -159,7 +160,7 @@ export default function App() {
                   a.download = `${result.document_id ?? "export"}.toml`
                   a.click()
                   URL.revokeObjectURL(url)
-                } catch (err) {
+                } catch {
                   alert("Failed to download TOML")
                 }
               }}
@@ -171,64 +172,56 @@ export default function App() {
           <pre style={styles.jsonBox}>
             {JSON.stringify(result, null, 2)}
           </pre>
-
         </div>
       )}
     </div>
   )
 }
 
-function EntityGroup({ label, items, color }) {
-  if (!items || items.length === 0) return null
+function DataPreview({ rows }) {
+  if (!rows?.length) {
+    return <p style={{ color: "#64748b" }}>No rows.</p>
+  }
+  const keys = [...new Set(rows.flatMap((r) => Object.keys(r)))]
   return (
-    <div style={{ ...styles.entityGroup, borderColor: color }}>
-      <h3 style={{ ...styles.entityLabel, color }}>{label}</h3>
-      {items.map((item, i) => (
-        <div key={i} style={styles.entityItem}>
-          <span style={styles.entityValue}>{item.value}</span>
-          <div style={styles.confBarBg}>
-            <div style={{
-              ...styles.confBarFill,
-              width: `${(item.confidence ?? 0) * 100}%`,
-              background: color
-            }} />
-          </div>
-          <span style={styles.confText}>
-            {((item.confidence ?? 0) * 100).toFixed(0)}%
-          </span>
-        </div>
-      ))}
+    <div style={{ overflowX: "auto", borderRadius: 10, border: "1px solid #334155" }}>
+      <table style={styles.table}>
+        <thead>
+          <tr>
+            {keys.map((k) => (
+              <th key={k} style={styles.th}>{k}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={i} style={i % 2 ? styles.trAlt : undefined}>
+              {keys.map((k) => (
+                <td key={k} style={styles.td}>{r[k] === null || r[k] === undefined ? "" : String(r[k])}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }
 
 const styles = {
-  container: { maxWidth: 800, margin: "0 auto", padding: "40px 20px", fontFamily: "system-ui, sans-serif", background: "#0f172a", minHeight: "100vh", color: "#e2e8f0" },
+  container: { maxWidth: 960, margin: "0 auto", padding: "40px 20px", fontFamily: "system-ui, sans-serif", background: "#0f172a", minHeight: "100vh", color: "#e2e8f0" },
   title: { fontSize: 36, fontWeight: 800, margin: 0, color: "#f8fafc" },
   subtitle: { color: "#94a3b8", marginTop: 4, marginBottom: 32 },
   uploadBox: { background: "#1e293b", border: "2px dashed #334155", borderRadius: 12, padding: 32, textAlign: "center" },
   fileInput: { marginBottom: 16 },
   fileName: { color: "#94a3b8", margin: "8px 0 16px" },
+  select: { background: "#0f172a", color: "#e2e8f0", border: "1px solid #334155", borderRadius: 8, padding: "8px 12px", fontSize: 14 },
   button: { background: "#3b82f6", color: "#fff", border: "none", borderRadius: 8, padding: "12px 28px", fontSize: 16, cursor: "pointer", fontWeight: 600 },
   errorBox: { background: "#450a0a", border: "1px solid #ef4444", borderRadius: 8, padding: 16, marginTop: 24, color: "#fca5a5" },
   resultContainer: { marginTop: 32 },
-  statusRow: { display: "flex", alignItems: "center", gap: 16, marginBottom: 24 },
+  statusRow: { display: "flex", alignItems: "center", gap: 16, marginBottom: 24, flexWrap: "wrap" },
   badge: { padding: "4px 14px", borderRadius: 999, fontWeight: 700, fontSize: 13, color: "#fff" },
   docId: { color: "#64748b", fontSize: 13 },
   sectionTitle: { fontSize: 18, fontWeight: 700, color: "#cbd5e1", margin: "24px 0 12px" },
-  cardGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 },
-  entityGroup: { background: "#1e293b", border: "1px solid", borderRadius: 10, padding: 16 },
-  entityLabel: { margin: "0 0 12px", fontSize: 14, fontWeight: 700 },
-  entityItem: { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 },
-  entityValue: { flex: 1, fontSize: 14 },
-  confBarBg: { width: 60, height: 6, background: "#334155", borderRadius: 999 },
-  confBarFill: { height: 6, borderRadius: 999 },
-  confText: { fontSize: 12, color: "#64748b", width: 30 },
-  relBox: { background: "#1e293b", borderRadius: 10, padding: 16 },
-  relRow: { display: "flex", alignItems: "center", gap: 12, marginBottom: 8 },
-  relTag: { background: "#334155", padding: "4px 10px", borderRadius: 6, fontSize: 13 },
-  relArrow: { color: "#64748b", fontSize: 13 },
-  confidence: { marginLeft: "auto", color: "#64748b", fontSize: 12 },
   metaBox: { background: "#1e293b", borderRadius: 10, padding: 16 },
   metaRow: { display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #334155" },
   metaKey: { color: "#64748b", fontSize: 13 },
@@ -245,4 +238,8 @@ const styles = {
     marginBottom: 12,
     fontWeight: 600
   },
+  table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
+  th: { textAlign: "left", padding: "10px 12px", background: "#334155", color: "#cbd5e1", borderBottom: "1px solid #475569" },
+  td: { padding: "8px 12px", borderBottom: "1px solid #334155", color: "#e2e8f0" },
+  trAlt: { background: "#1e293b" },
 }

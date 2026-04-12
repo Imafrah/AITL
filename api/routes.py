@@ -2,12 +2,15 @@ import os
 import asyncio
 from pathlib import Path
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Body
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, UploadFile, File, HTTPException, Body, Query
+from fastapi.responses import PlainTextResponse, Response
 
 from db.crud import get_document, DBError
-from orchestrator import run_pipeline
 from post_processor.processor import convert_to_toml
+
+from core.file_router import route_file as classify_upload
+from core.output_formatter import to_csv_file
+from core.universal_pipeline import process_universal
 
 router = APIRouter()
 
@@ -23,7 +26,10 @@ def _extension_from_filename(name: str | None) -> str | None:
 
 
 @router.post("/translate")
-async def translate(file: UploadFile = File(...)):
+async def translate(
+    file: UploadFile = File(...),
+    fmt: str = Query("json", alias="format", description='Response shape: "json", "table", or "csv"'),
+):
     ext = _extension_from_filename(file.filename)
     if not ext or ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -32,6 +38,12 @@ async def translate(file: UploadFile = File(...)):
                 f"Unsupported or missing file extension: {ext or 'none'}. "
                 "Allowed: pdf, csv, txt"
             ),
+        )
+
+    if fmt not in ("json", "table", "csv"):
+        raise HTTPException(
+            status_code=422,
+            detail='Invalid format. Use format=json, format=table, or format=csv',
         )
 
     content = b""
@@ -48,22 +60,34 @@ async def translate(file: UploadFile = File(...)):
         raise HTTPException(status_code=422,
             detail="File is empty.")
 
-    if not os.getenv("GEMINI_API_KEY"):
-        raise HTTPException(status_code=500,
-            detail="Server configuration error: GEMINI_API_KEY is not set.")
+    if classify_upload(file.filename or "") == "unstructured" and not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(
+            status_code=500,
+            detail="Server configuration error: GEMINI_API_KEY is required for TXT/PDF.",
+        )
 
     try:
-        if ext == "csv":
-            from parsers.csv_parser import parse_csv_documents
-
-            result = await asyncio.to_thread(parse_csv_documents, content)
-        else:
-            result = await asyncio.to_thread(run_pipeline, content, ext, file.filename)
+        envelope = await asyncio.to_thread(
+            process_universal,
+            content,
+            file.filename or "upload",
+            fmt,
+            os.getenv("GEMINI_API_KEY"),
+        )
     except Exception as e:
         raise HTTPException(status_code=500,
             detail=f"Processing failed: {str(e)}")
 
-    return result
+    if fmt == "csv":
+        body = to_csv_file(envelope.get("data") or [], "export.csv")
+        stem = Path(file.filename or "export").stem
+        return Response(
+            content=body,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{stem}.csv"'},
+        )
+
+    return envelope
 
 
 @router.post("/export/toml", response_class=PlainTextResponse)

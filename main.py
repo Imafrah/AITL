@@ -8,11 +8,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import router
 from db.database import init_db
+from core.schema_memory import init_schema_memory
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    init_schema_memory()
     yield
 
 

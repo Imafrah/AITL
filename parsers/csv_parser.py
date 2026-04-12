@@ -2,6 +2,7 @@ import csv
 import io
 import re
 import logging
+from typing import Any
 
 import pandas as pd
 
@@ -109,6 +110,179 @@ def _apply_aliases(row: dict, alias_map: dict[str, str]) -> dict:
         if out.get(canon) in (None, ""):
             out[canon] = v
     return out
+
+
+def dynamic_map_row(row: dict, mapping: dict[str, Any]) -> dict[str, Any]:
+    """
+    Map CSV row values into semantic slots using AI/rule-provided column lists.
+    Column names are matched with the same normalization as schema detection.
+    """
+    by_norm: dict[str, Any] = {}
+    for k, v in row.items():
+        nk = normalize_field_name(str(k))
+        if nk:
+            by_norm[nk] = v
+    out: dict[str, Any] = {}
+    for target, cols in mapping.items():
+        if cols is None:
+            continue
+        if not isinstance(cols, list):
+            cols = [cols]
+        for col in cols:
+            cn = normalize_field_name(str(col))
+            if not cn:
+                continue
+            if cn in by_norm:
+                val = by_norm[cn]
+                if val not in (None, ""):
+                    out[str(target)] = val
+                    break
+    return out
+
+
+def _ai_row_document_id(row: dict, mapped: dict[str, Any], row_index: int) -> str:
+    for k, v in row.items():
+        nk = normalize_field_name(str(k))
+        if nk.endswith("_id") or nk == "id":
+            s = str(v).strip() if v is not None else ""
+            if s:
+                return s[:120]
+    for v in mapped.values():
+        if v not in (None, ""):
+            slug = re.sub(r"[^\w\-]+", "_", str(v).strip())[:48]
+            if slug:
+                return f"ai-{row_index}-{slug}"
+    return f"ai-{row_index}"
+
+
+def _ai_mapped_relationships(schema_type: str, entities: dict) -> list[dict]:
+    st = (schema_type or "generic").lower()
+    rels: list[dict] = []
+    has_p = bool(entities.get("person_names"))
+    has_o = bool(entities.get("organizations"))
+    has_a = bool(entities.get("amounts"))
+
+    if st == "employee" and has_p and has_o:
+        rel_attrs: dict = {}
+        if has_a:
+            rel_attrs["amount"] = "a1"
+        rels.append(
+            {
+                "type": "employed_by",
+                "from": "p1",
+                "to": "o1",
+                "confidence": 0.85,
+                "attributes": rel_attrs,
+            }
+        )
+    elif st in ("transaction", "invoice") and has_p and has_o:
+        rel_attrs = {}
+        if has_a:
+            rel_attrs["amount"] = "a1"
+        if entities.get("dates"):
+            rel_attrs["date"] = "d1"
+        rels.append(
+            {
+                "type": "payment",
+                "from": "p1",
+                "to": "o1",
+                "confidence": 0.82,
+                "attributes": rel_attrs,
+            }
+        )
+    elif st == "sales" and has_o and has_a:
+        rels.append(
+            {
+                "type": "sale",
+                "from": "o1",
+                "to": "unknown_buyer",
+                "confidence": 0.8,
+                "attributes": {"amount": "a1"},
+            }
+        )
+    return rels
+
+
+def process_ai_mapped_row(
+    row: dict,
+    mapping: dict[str, Any],
+    schema_type: str,
+    row_index: int,
+) -> dict:
+    """Build one structured document from a row using AI-derived column mapping."""
+    m = dynamic_map_row(row, mapping)
+    doc_id = _ai_row_document_id(row, m, row_index)
+
+    entities: dict = {"person_names": [], "organizations": [], "dates": [], "amounts": []}
+
+    pn = m.get("person_name")
+    if pn not in (None, ""):
+        entities["person_names"].append(
+            {"id": "p1", "value": str(pn).strip(), "confidence": 0.88}
+        )
+
+    org = m.get("organization")
+    if org not in (None, ""):
+        entities["organizations"].append(
+            {"id": "o1", "value": str(org).strip(), "confidence": 0.85}
+        )
+
+    dv = m.get("date")
+    if dv not in (None, ""):
+        entities["dates"].append(
+            {"id": "d1", "value": str(dv).strip(), "confidence": 0.82}
+        )
+
+    amt = m.get("amount")
+    if amt is not None:
+        num = safe_float(str(amt))
+        if num is not None:
+            cur_raw = m.get("currency")
+            if cur_raw is None or str(cur_raw).strip() == "":
+                cur_s = "USD"
+            else:
+                cur_s = str(cur_raw).strip()[:8]
+            entities["amounts"].append(
+                {
+                    "id": "a1",
+                    "value": num,
+                    "currency": cur_s,
+                    "label": "amount",
+                    "confidence": 0.86,
+                }
+            )
+
+    relationships = _ai_mapped_relationships(schema_type, entities)
+
+    doc_type_map = {
+        "employee": "employee_record",
+        "transaction": "transaction",
+        "invoice": "transaction",
+        "sales": "sales_record",
+        "generic": "ai_mapped_csv",
+    }
+    document_type = doc_type_map.get((schema_type or "generic").lower(), "ai_mapped_csv")
+
+    status = "success" if any(entities[k] for k in entities) else "partial"
+    err = (
+        None
+        if status == "success"
+        else "AI mapping produced no extractable fields for this row."
+    )
+
+    return {
+        "document_id": doc_id,
+        "document_type": document_type,
+        "status": status,
+        "error": err,
+        "entities": entities,
+        "relationships": relationships,
+        "metadata": {
+            "file_type": "csv",
+            "schema_source": "ai",
+            "ai_schema_type": schema_type,
+        },
+    }
 
 
 def _detect_csv_schema(fieldnames: list[str]) -> str:
@@ -511,8 +685,13 @@ def parse_csv(file_bytes: bytes) -> dict:
         raise ParseError(f"Failed to parse CSV: {e}") from e
 
 
-def parse_csv_documents(file_bytes: bytes) -> list[dict]:
-    """Parse CSV into one structured document per row (translate API, no AI)."""
+def parse_csv_documents(file_bytes: bytes, api_key: str | None = None) -> list[dict]:
+    """
+    Parse CSV into one structured document per row (translate API).
+
+    Hybrid: rule-based schema when confident; otherwise optional AI column mapping
+    when ``api_key`` is set (same env as main extractor).
+    """
     try:
         content = file_bytes.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -521,35 +700,72 @@ def parse_csv_documents(file_bytes: bytes) -> list[dict]:
     reader = csv.DictReader(io.StringIO(content))
     raw_headers = reader.fieldnames or []
     fieldnames = [str(f).strip() for f in raw_headers if f is not None and str(f).strip()]
-    schema = _detect_csv_schema(fieldnames)
-    logger.info("CSV schema=%s | headers=%s", schema, fieldnames)
+    rows = list(reader)
 
-    results = []
+    schema = _detect_csv_schema(fieldnames)
+    logger.info("CSV schema=%s | headers=%s | rows=%s", schema, fieldnames, len(rows))
+
+    ai_mapping: dict[str, Any] | None = None
+    ai_schema_type = "generic"
+
+    if schema == "generic" and api_key and str(api_key).strip() and rows:
+        sample: list[dict] = []
+        for raw in rows[:8]:
+            if any(str(v).strip() for v in raw.values() if v is not None):
+                sample.append(clean_csv_row(dict(raw)))
+            if len(sample) >= 5:
+                break
+        if sample:
+            try:
+                from ai_layer.schema_detector import detect_schema_ai
+
+                ai_result = detect_schema_ai(sample, api_key)
+                raw_map = ai_result.get("mapping") or {}
+                if raw_map:
+                    ai_mapping = raw_map
+                    ai_schema_type = str(ai_result.get("schema_type", "generic")).lower()
+                    logger.info(
+                        "CSV AI schema=%s | mapped_roles=%s",
+                        ai_schema_type,
+                        list(ai_mapping.keys()),
+                    )
+                else:
+                    logger.warning(
+                        "AI schema detection returned empty mapping; using heuristics."
+                    )
+            except Exception as e:
+                logger.warning("AI schema detection skipped: %s", e)
+
+    results: list[dict] = []
     MAX_ROWS = 1000
 
-    for idx, row in enumerate(reader):
+    for idx, raw_row in enumerate(rows):
         if idx >= MAX_ROWS:
-            logger.warning(f"CSV exceeded maximum allowed rows ({MAX_ROWS}). Truncating.")
+            logger.warning("CSV exceeded maximum allowed rows (%s). Truncating.", MAX_ROWS)
             break
 
-        if not any(str(v).strip() for v in row.values() if v is not None):
+        if not any(str(v).strip() for v in raw_row.values() if v is not None):
             continue
 
-        row = clean_csv_row(dict(row))
+        row = clean_csv_row(dict(raw_row))
 
         try:
             if schema == "transaction":
-                doc = process_transaction_row(_apply_aliases(row, _TRANSACTION_ALIASES), idx + 1)
+                doc = process_transaction_row(
+                    _apply_aliases(row, _TRANSACTION_ALIASES), idx + 1
+                )
             elif schema == "employee":
                 doc = process_employee_row(_apply_aliases(row, _EMPLOYEE_ALIASES), idx + 1)
             elif schema == "sales":
                 doc = process_sales_row(_apply_aliases(row, _SALES_ALIASES), idx + 1)
+            elif ai_mapping:
+                doc = process_ai_mapped_row(row, ai_mapping, ai_schema_type, idx + 1)
             else:
                 doc = process_generic_tabular_row(row, idx + 1)
             results.append(doc)
 
         except Exception as e:
-            logger.error(f"Error processing row {idx}: {e}")
+            logger.error("Error processing row %s: %s", idx, e)
             results.append(
                 {
                     "document_id": f"error-{idx}",
