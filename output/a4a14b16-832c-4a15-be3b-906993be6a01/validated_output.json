@@ -1,0 +1,60 @@
+{
+  "document_id": "a4a14b16-832c-4a15-be3b-906993be6a01",
+  "validated_output": [
+    {
+      "v1": 1.0,
+      "v2": "twenty five",
+      "is_valid_email": false,
+      "is_valid_date": true,
+      "is_valid_numeric": true,
+      "confidence": 0.95,
+      "is_anomaly": false
+    }
+  ],
+  "metadata": {
+    "file_type": "csv",
+    "row_count": 1,
+    "processed_at": "2026-04-12T11:50:48.765102+00:00",
+    "analytics": {
+      "total_records": 1,
+      "numeric_columns": {
+        "v1": {
+          "avg": 1.0,
+          "min": 1.0,
+          "max": 1.0,
+          "count": 1
+        }
+      },
+      "city_distribution": {},
+      "avg_salary": null,
+      "max_salary": null,
+      "min_salary": null,
+      "records_with_salary": 0,
+      "numeric_summary": {
+        "amount": {
+          "avg": null,
+          "min": null,
+          "max": null,
+          "count": 0
+        },
+        "quantity": {
+          "avg": null,
+          "min": null,
+          "max": null,
+          "count": 0
+        }
+      }
+    },
+    "validation": {
+      "valid_email_count": 0,
+      "valid_phone_count": 0,
+      "valid_salary_count": 0,
+      "valid_date_count": 1,
+      "valid_numeric_count": 1
+    },
+    "critical_fields": [
+      "v1"
+    ],
+    "semantic_map": {}
+  }
+}

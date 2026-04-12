@@ -1,6 +1,8 @@
 """
 Universal file intelligence pipeline — hybrid rules + AI, SQLite schema memory,
 row-level universal output.
+
+Flow: parse → clean → validate → analyze → **final cleaning** (repair + schema-unify).
 """
 
 from __future__ import annotations
@@ -358,7 +360,9 @@ def process_universal(
 ) -> dict[str, Any]:
     """
     Main entry: returns universal envelope.
-    ``output_format``: json | table | csv | dashboard
+
+    Stages: parse → clean → validate → analyze → final cleaning (type repair, imputation,
+    schema enforcement, row QC). ``output_format``: json | table | csv | dashboard
     (csv returns raw bytes from the route; dashboard adds summary + charts + sample rows).
     """
     kind = classify_file(filename or "")
@@ -372,6 +376,9 @@ def process_universal(
             "status": "failed",
             "error": "Unsupported file type.",
             "data": [],
+            "validated_output": [],
+            "cleaned_data": [],
+            "final_cleaned_output": [],
             "metadata": {
                 "file_type": "unknown",
                 "row_count": 0,
@@ -476,9 +483,7 @@ def process_universal(
     if final_status == "failed" and data:
         final_status = "partial"
 
-    cleaned_data, cleaning_stats = run_final_cleaning_layer(
-        data, critical_fields=critical
-    )
+    cleaned_data, cleaning_stats = run_final_cleaning_layer(data)
     intermediate_metadata: dict[str, Any] = {
         "file_type": meta.get("file_type", "unknown"),
         "row_count": len(data),
@@ -495,7 +500,10 @@ def process_universal(
     try:
         output_paths = write_cleaning_outputs(
             document_id,
-            {"data": copy.deepcopy(data), "metadata": intermediate_metadata},
+            {
+                "validated_output": copy.deepcopy(data),
+                "metadata": intermediate_metadata,
+            },
             cleaned_data,
         )
     except Exception as e:
@@ -506,7 +514,9 @@ def process_universal(
         "document_type": str(meta.get("document_type", "auto")),
         "status": final_status,
         "data": data,
+        "validated_output": data,
         "cleaned_data": cleaned_data,
+        "final_cleaned_output": cleaned_data,
         "error": meta.get("error"),
         "metadata": {
             **intermediate_metadata,
