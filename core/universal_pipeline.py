@@ -17,7 +17,13 @@ from typing import Any
 
 from core.analytics_engine import compute_analytics
 from core.anomaly_detector import apply_anomaly_detection
-from core.cleaning import build_clean_row, is_valid_email, is_valid_phone, is_valid_salary
+from core.cleaning import (
+    build_clean_row,
+    is_valid_date,
+    is_valid_email,
+    is_valid_phone,
+    is_valid_salary,
+)
 from core.dashboard_formatter import build_dashboard
 from core.final_cleaning import detect_field_types, run_final_cleaning_layer, write_cleaning_outputs
 from core.file_router import route_file as classify_file
