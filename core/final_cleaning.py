@@ -37,6 +37,8 @@ from parsers.csv_parser import normalize_field_name
 
 logger = logging.getLogger(__name__)
 
+_EMAIL_LIKE_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
 _RESERVED_KEYS = frozenset(
     {
         "confidence",
@@ -50,6 +52,18 @@ _RESERVED_KEYS = frozenset(
 
 # Internal / lineage keys — never imputed, excluded from missing-rate denominators.
 _INTERNAL_KEYS = frozenset({"__imputed__"})
+_PIPELINE_ARTIFACT_KEYS = frozenset(
+    {
+        "__imputed__",
+        "imputed",
+        "confidence",
+        "is_anomaly",
+        "is_outlier",
+        "is_valid_email",
+        "is_valid_date",
+        "is_valid_numeric",
+    }
+)
 
 # Keys used only for QC / scoring — excluded from "missing rate" so rows are not
 # penalized for synthetic boolean fields.
@@ -289,8 +303,74 @@ def _coerce_number(value: Any) -> float | int | None:
 
 
 def _looks_like_email_string(s: str) -> bool:
-    t = s.strip()
-    return "@" in t and "." in t.split("@")[-1]
+    return bool(_EMAIL_LIKE_RE.match(s.strip()))
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        return None
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"true", "t", "yes", "y", "1"}:
+            return True
+        if v in {"false", "f", "no", "n", "0"}:
+            return False
+    return None
+
+
+def _detect_boolean_columns(records: list[dict[str, Any]], keys: Iterable[str]) -> set[str]:
+    out: set[str] = set()
+    for k in keys:
+        nk = normalize_field_name(k)
+        vals = [r.get(k) for r in records if _is_present(r.get(k))]
+        if not vals:
+            continue
+        bool_hits = sum(1 for v in vals if _coerce_bool(v) is not None)
+        ratio = bool_hits / len(vals)
+        name_hint = (
+            nk.startswith("is_")
+            or nk.startswith("has_")
+            or "flag" in nk
+            or "enabled" in nk
+            or "active" in nk
+            or "applied" in nk
+        )
+        if ratio >= 0.8 or (name_hint and ratio >= 0.5):
+            out.add(k)
+    return out
+
+
+def _safe_default_for_field(
+    key: str,
+    *,
+    numeric_cols: set[str],
+    date_cols: set[str],
+    text_cols: set[str],
+    bool_cols: set[str],
+) -> Any:
+    if key in bool_cols:
+        return False
+    if key in numeric_cols:
+        return 0
+    if key in date_cols:
+        return "unknown"
+    if key in text_cols:
+        return "unknown"
+    return "unknown"
+
+
+def _strip_pipeline_artifacts(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: v
+        for k, v in row.items()
+        if k not in _PIPELINE_ARTIFACT_KEYS and not str(k).startswith("__")
+    }
 
 
 def detect_field_types(records: list[dict[str, Any]]) -> dict[str, set[str]]:
@@ -547,16 +627,19 @@ def _refresh_validation_flags(
 ) -> None:
     """Recompute validation booleans using dynamically detected column sets."""
     # Email validation — check ALL detected email columns, not just "email"
-    e_cols = email_cols or {"email"}
-    any_email_valid = False
-    any_email_present = False
-    for ek in e_cols:
-        em = record.get(ek)
-        if em and str(em).strip():
-            any_email_present = True
-            if is_valid_email(str(em)):
-                any_email_valid = True
-    record["is_valid_email"] = any_email_valid if any_email_present else True
+    e_cols = email_cols or set()
+    if e_cols:
+        any_email_valid = False
+        any_email_present = False
+        for ek in e_cols:
+            em = record.get(ek)
+            if em and str(em).strip():
+                any_email_present = True
+                if is_valid_email(str(em)):
+                    any_email_valid = True
+        record["is_valid_email"] = any_email_valid if any_email_present else True
+    else:
+        record.pop("is_valid_email", None)
 
     # Date validation — check ALL detected date columns, not just "date"
     d_cols = date_cols or {"date"}
@@ -570,7 +653,11 @@ def _refresh_validation_flags(
                 any_date_invalid = True
     record["is_valid_date"] = not any_date_invalid if any_date_present else True
 
-    record["is_valid_numeric"] = validate_row_numeric_aggregate(record)
+    if validate_row_numeric_aggregate(record):
+        record["is_valid_numeric"] = True
+    else:
+        # Keep false only when a field looked numeric-like but parsing failed.
+        record["is_valid_numeric"] = False
 
 
 def _missing_ratio(record: dict[str, Any], schema_keys: list[str]) -> float:
@@ -892,9 +979,69 @@ def run_final_cleaning_layer(
             r.pop("__imputed__", None)
         working = [_reorder_record_keys(r, [k for k in key_order if k != "__imputed__"]) for r in working]
 
-    if cfg.clean_mode == "strict":
-        critical_fields = infer_critical_fields(working)
-        working = dynamic_adaptive_cleaning(working, critical_fields)
+    # Final production shaping:
+    # - remove all pipeline artifacts from row payload
+    # - normalize booleans
+    # - drop rows with null critical fields
+    # - fill non-critical nulls with safe dynamic defaults
+    content_keys = sorted(
+        {
+            k
+            for r in working
+            for k in r.keys()
+            if k not in _PIPELINE_ARTIFACT_KEYS and not str(k).startswith("__")
+        }
+    )
+    final_types = detect_field_types(working) if working else {"numeric": set(), "email": set(), "date": set(), "text": set()}
+    final_numeric = set(final_types.get("numeric", set()))
+    final_date = set(final_types.get("date", set()))
+    final_text = set(final_types.get("text", set()))
+    final_bool = _detect_boolean_columns(working, content_keys) if working else set()
+    final_critical = infer_critical_fields(working) if working else []
+
+    shaped: list[dict[str, Any]] = []
+    dropped_for_critical = 0
+    for row in working:
+        r = _strip_pipeline_artifacts(dict(row))
+
+        # Normalize boolean values for inferred boolean columns.
+        for bk in final_bool:
+            if bk in r:
+                bval = _coerce_bool(r.get(bk))
+                if bval is not None:
+                    r[bk] = bval
+
+        # Critical fields are mandatory in final output.
+        if any(not _is_present(r.get(cf)) for cf in final_critical):
+            dropped_for_critical += 1
+            continue
+
+        # Fill all remaining nulls/empty values with dynamic safe defaults.
+        for k in content_keys:
+            if not _is_present(r.get(k)):
+                r[k] = _safe_default_for_field(
+                    k,
+                    numeric_cols=final_numeric,
+                    date_cols=final_date,
+                    text_cols=final_text,
+                    bool_cols=final_bool,
+                )
+
+        # Final hard guarantee: no residual None.
+        for k in list(r.keys()):
+            if r.get(k) is None:
+                r[k] = _safe_default_for_field(
+                    k,
+                    numeric_cols=final_numeric,
+                    date_cols=final_date,
+                    text_cols=final_text,
+                    bool_cols=final_bool,
+                )
+        shaped.append(r)
+
+    if dropped_for_critical:
+        stats["low_quality_removed"] += dropped_for_critical
+    working = shaped
 
     rows_out = len(working)
 
@@ -921,7 +1068,6 @@ def run_final_cleaning_layer(
     # Override stats explicitly for true final cleaner
     if cfg.clean_mode == "strict":
         stats["missing_values_filled"] = True
-        null_rate_after = 0.0
 
     stats["invalid_values_replaced"] = invalid_changed
     stats["rows_out"] = rows_out

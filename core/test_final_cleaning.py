@@ -267,6 +267,11 @@ class TestDynamicValidation:
         _refresh_validation_flags(record, email_cols=set(), date_cols=set())
         assert record["is_valid_date"] is True
 
+    def test_no_email_columns_skips_email_flag(self):
+        record = {"name": "Test", "amount": 10}
+        _refresh_validation_flags(record, email_cols=set(), date_cols=set())
+        assert "is_valid_email" not in record
+
 
 # ── 5. Null Rate Computation ─────────────────────────────────────────────────
 
@@ -607,6 +612,41 @@ class TestDataIntegrity:
         for r in cleaned:
             if r.get("phone") is not None:
                 assert r["phone"] != "unknown", "Phone should never get text placeholder"
+
+    def test_final_rows_strip_pipeline_artifacts(self):
+        records = [
+            {
+                "transaction_id": "T1",
+                "quantity": 10,
+                "item": None,
+                "is_valid_email": True,
+                "is_valid_numeric": False,
+                "is_valid_date": True,
+                "is_anomaly": True,
+                "confidence": 0.9,
+                "__imputed__": {"item": "text_placeholder"},
+            }
+        ]
+        cleaned, _ = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
+        assert cleaned, "Expected at least one row after strict cleaning"
+        row = cleaned[0]
+        assert "is_valid_email" not in row
+        assert "is_valid_numeric" not in row
+        assert "is_valid_date" not in row
+        assert "is_anomaly" not in row
+        assert "confidence" not in row
+        assert "__imputed__" not in row
+        assert row["item"] == "unknown"
+
+    def test_boolean_normalization_to_true_false(self):
+        records = [
+            {"transaction_id": "T1", "discount_applied": "True", "amount": 100},
+            {"transaction_id": "T2", "discount_applied": "false", "amount": 200},
+        ]
+        cleaned, _ = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
+        assert len(cleaned) == 2
+        vals = [r["discount_applied"] for r in cleaned]
+        assert vals == [True, False]
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from core.cleaning import amount_from_value
 from parsers.csv_parser import normalize_field_name
 
 logger = logging.getLogger(__name__)
@@ -126,7 +127,6 @@ _ROLE_SPECS: tuple[tuple[str, frozenset[str]], ...] = (
                 "tax",
                 "fee",
                 "balance",
-                "payment",
                 "net",
                 "gross",
                 "grand_total",
@@ -135,6 +135,22 @@ _ROLE_SPECS: tuple[tuple[str, frozenset[str]], ...] = (
                 "paid",
                 "due",
                 "value",
+            }
+        ),
+    ),
+    (
+        "payment_method",
+        frozenset(
+            {
+                "payment_method",
+                "payment_mode",
+                "payment_type",
+                "method",
+                "card_type",
+                "cash",
+                "upi",
+                "wallet",
+                "bank_transfer",
             }
         ),
     ),
@@ -240,6 +256,9 @@ def dynamic_semantic_map(row: dict[str, Any], field_map: dict[str, Any]) -> dict
             if v is None:
                 continue
             if isinstance(v, str) and not v.strip():
+                continue
+            # Guard against semantic confusion: monetary roles must hold numeric-like values.
+            if role in ("amount_monetary", "salary_comp") and amount_from_value(v) is None:
                 continue
             out[role] = v
             break

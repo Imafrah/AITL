@@ -131,6 +131,7 @@ def semantic_intelligence_row(
     phone = clean_phone(sem.get("phone"))
     location = normalize_city(sem.get("location"))
     status = normalize_status_value(sem.get("status"))
+    payment_method = sem.get("payment_method")
 
     qty_raw = sem.get("quantity")
     quantity = _quantity_parsed(qty_raw)
@@ -156,6 +157,8 @@ def semantic_intelligence_row(
         rec["date"] = date_val
     if status:
         rec["status"] = status
+    if payment_method is not None and str(payment_method).strip():
+        rec["payment_method"] = str(payment_method).strip()[:128]
     if location:
         rec["city"] = location
 
