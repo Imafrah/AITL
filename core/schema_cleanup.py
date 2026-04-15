@@ -148,6 +148,24 @@ def infer_critical_fields(records: list[dict[str, Any]]) -> list[str]:
 
     n = len(records)
     stats: dict[str, dict[str, Any]] = {}
+    importance_tokens = (
+        "id",
+        "uuid",
+        "ref",
+        "reference",
+        "txn",
+        "transaction",
+        "amount",
+        "total",
+        "price",
+        "cost",
+        "date",
+        "time",
+        "timestamp",
+        "quantity",
+        "qty",
+        "count",
+    )
 
     for r in records:
         for k, v in r.items():
@@ -155,9 +173,10 @@ def infer_critical_fields(records: list[dict[str, Any]]) -> list[str]:
                 continue
             if k in ("name",):  # redundant with person_name
                 continue
-            st = stats.setdefault(k, {"filled": 0, "numeric": 0})
+            st = stats.setdefault(k, {"filled": 0, "numeric": 0, "distinct": set()})
             if v is not None and (not isinstance(v, str) or v.strip()):
                 st["filled"] += 1
+                st["distinct"].add(str(v).strip().lower())
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v:
                     st["numeric"] += 1
 
@@ -168,7 +187,11 @@ def infer_critical_fields(records: list[dict[str, Any]]) -> list[str]:
         id_like = nk == "id" or nk.endswith("_id") or nk in ("uuid", "key", "ref", "reference")
         num_ratio = st["numeric"] / st["filled"] if st["filled"] else 0.0
         mostly_numeric = num_ratio >= 0.85 and st["numeric"] > 0
-        if id_like or (fill_ratio >= 0.75 and st["filled"] >= max(3, n // 2)) or mostly_numeric:
+        name_important = any(tok in nk for tok in importance_tokens)
+        uniqueness_ratio = len(st["distinct"]) / st["filled"] if st["filled"] else 0.0
+        highly_unique = st["filled"] >= max(3, n // 2) and uniqueness_ratio >= 0.90
+        high_fill = fill_ratio >= 0.75 and st["filled"] >= max(3, n // 2)
+        if id_like or name_important or highly_unique or high_fill or mostly_numeric:
             critical.append(k)
 
     out = sorted(set(critical))[:16]

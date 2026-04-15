@@ -873,10 +873,11 @@ def run_final_cleaning_layer(
     before_filter = len(working)
     kept: list[dict[str, Any]] = []
 
+    critical_fields = infer_critical_fields(working)
+    stats["critical_fields_detected"] = critical_fields
+
     if cfg.clean_mode == "strict":
         # Detect critical fields dynamically (high fill-rate, id-like, numeric-heavy)
-        critical_fields = infer_critical_fields(working)
-        stats["critical_fields_detected"] = critical_fields
         logger.info("Strict mode | critical fields detected: %s", critical_fields)
 
         for r in working:
@@ -914,10 +915,11 @@ def run_final_cleaning_layer(
 
             kept.append(r)
     else:
-        # SAFE mode: keep ALL rows — no quality-based removal
-        stats["critical_fields_detected"] = []
-        # Only honour explicit email_invalid_strategy="remove_row" if set
+        # SAFE mode: only remove rows when 2+ critical fields are missing.
         for r in working:
+            missing_critical_n = sum(1 for cf in critical_fields if not _is_present(r.get(cf)))
+            if missing_critical_n >= 2:
+                continue
             if cfg.email_invalid_strategy == "remove_row":
                 drop = False
                 for ek in email_cols:
@@ -1011,8 +1013,12 @@ def run_final_cleaning_layer(
                 if bval is not None:
                     r[bk] = bval
 
-        # Critical fields are mandatory in final output.
-        if any(not _is_present(r.get(cf)) for cf in final_critical):
+        # Mode-aware critical filtering in final shaping for consistency.
+        missing_critical_n = sum(1 for cf in final_critical if not _is_present(r.get(cf)))
+        if cfg.clean_mode == "strict" and missing_critical_n >= 1:
+            dropped_for_critical += 1
+            continue
+        if cfg.clean_mode != "strict" and missing_critical_n >= 2:
             dropped_for_critical += 1
             continue
 

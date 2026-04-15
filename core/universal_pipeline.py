@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +19,7 @@ from core.analytics_engine import compute_analytics
 from core.anomaly_detector import apply_anomaly_detection
 from core.cleaning import build_clean_row, is_valid_email, is_valid_phone, is_valid_salary
 from core.dashboard_formatter import build_dashboard
-from core.final_cleaning import run_final_cleaning_layer, write_cleaning_outputs
+from core.final_cleaning import detect_field_types, run_final_cleaning_layer, write_cleaning_outputs
 from core.file_router import route_file as classify_file
 from core.intelligence_record import coerce_intelligence_row, dedupe_intelligence_rows
 from core.output_formatter import to_table
@@ -33,6 +34,59 @@ from core.schema_memory import get_schema_from_memory, save_schema_to_memory
 logger = logging.getLogger(__name__)
 
 MAX_CSV_ROWS = int(__import__("os").getenv("AITL_MAX_CSV_ROWS", "100000"))
+
+
+def _is_present(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, str) and not v.strip():
+        return False
+    return True
+
+
+def _is_numeric_like(v: Any) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return v == v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return False
+        if re.fullmatch(r"[\s$€£₹-]*\d[\d,.\s$€£₹%-]*", s):
+            return True
+    return False
+
+
+def _build_validation_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
+    field_types = detect_field_types(rows) if rows else {"numeric": set(), "email": set(), "date": set()}
+    numeric_cols = set(field_types.get("numeric", set()))
+    date_cols = set(field_types.get("date", set()))
+
+    valid_numeric_cells = 0
+    for r in rows:
+        for k in numeric_cols:
+            if _is_numeric_like(r.get(k)):
+                valid_numeric_cells += 1
+
+    valid_date_rows = 0
+    if date_cols:
+        for r in rows:
+            if all((not _is_present(r.get(k))) or is_valid_date(r.get(k)) for k in date_cols):
+                valid_date_rows += 1
+    else:
+        valid_date_rows = len(rows)
+
+    return {
+        "valid_email_count": sum(1 for r in rows if is_valid_email(r.get("email"))),
+        "valid_phone_count": sum(1 for r in rows if is_valid_phone(r.get("phone"))),
+        "valid_salary_count": sum(
+            1 for r in rows if is_valid_salary(r.get("salary") or r.get("amount"))
+        ),
+        "valid_date_count": valid_date_rows,
+        # Count valid numeric cells (dynamic numeric columns), not stale pre-clean row flags.
+        "valid_numeric_count": valid_numeric_cells,
+    }
 
 
 def structured_doc_to_row(doc: dict[str, Any]) -> dict[str, Any]:
@@ -444,15 +498,7 @@ def process_universal(
     if any_conf_adj:
         logger.info("Confidence adjusted dynamically")
     analytics = compute_analytics(data)
-    validation_summary = {
-        "valid_email_count": sum(1 for r in data if is_valid_email(r.get("email"))),
-        "valid_phone_count": sum(1 for r in data if is_valid_phone(r.get("phone"))),
-        "valid_salary_count": sum(
-            1 for r in data if is_valid_salary(r.get("salary") or r.get("amount"))
-        ),
-        "valid_date_count": sum(1 for r in data if r.get("is_valid_date")),
-        "valid_numeric_count": sum(1 for r in data if r.get("is_valid_numeric")),
-    }
+    validation_summary = _build_validation_summary(data)
 
     if not data:
         from core.fallback_extractor import fallback_extract
@@ -476,28 +522,25 @@ def process_universal(
             )
             r["confidence"] = conf
         analytics = compute_analytics(data)
-        validation_summary = {
-            "valid_email_count": sum(1 for r in data if is_valid_email(r.get("email"))),
-            "valid_phone_count": sum(1 for r in data if is_valid_phone(r.get("phone"))),
-            "valid_salary_count": sum(
-                1 for r in data if is_valid_salary(r.get("salary") or r.get("amount"))
-            ),
-            "valid_date_count": sum(1 for r in data if r.get("is_valid_date")),
-            "valid_numeric_count": sum(1 for r in data if r.get("is_valid_numeric")),
-        }
+        validation_summary = _build_validation_summary(data)
 
     final_status = st
     if final_status == "failed" and data:
         final_status = "partial"
 
     cleaned_data, cleaning_stats = run_final_cleaning_layer(data)
+    # Validation must reflect the cleaned output to avoid contradictory metadata.
+    validation_summary = _build_validation_summary(cleaned_data)
+    critical_for_metadata = cleaning_stats.get("critical_fields_detected") or infer_critical_fields(
+        cleaned_data
+    )
     intermediate_metadata: dict[str, Any] = {
         "file_type": meta.get("file_type", "unknown"),
         "row_count": len(data),
         "processed_at": processed_at,
         "analytics": analytics,
         "validation": validation_summary,
-        "critical_fields": critical,
+        "critical_fields": critical_for_metadata,
     }
     if meta.get("extraction"):
         intermediate_metadata["extraction"] = meta["extraction"]

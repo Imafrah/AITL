@@ -453,6 +453,26 @@ class TestOutputModes:
         remaining_names = [r.get("name") for r in cleaned]
         assert "B" not in remaining_names, "Strict should remove rows with missing numeric fields"
 
+    def test_safe_removes_only_when_two_or_more_critical_missing(self):
+        records = [
+            {"transaction_id": "T1", "amount": 100, "date": "2024-01-01", "quantity": 2},
+            {"transaction_id": "T2", "amount": 200, "date": None, "quantity": 3},  # 1 critical miss
+            {"transaction_id": None, "amount": None, "date": "2024-01-03", "quantity": 1},  # 2 misses
+        ]
+        cleaned, _ = run_final_cleaning_layer(records, config=_cfg(clean_mode="safe"))
+        ids = [r.get("transaction_id") for r in cleaned]
+        assert "T2" in ids, "SAFE mode should keep rows with only one missing critical field"
+        assert len(cleaned) == 2, "SAFE mode should drop rows with 2+ missing critical fields"
+
+    def test_strict_removes_when_any_critical_missing(self):
+        records = [
+            {"transaction_id": "T1", "amount": 100, "date": "2024-01-01", "quantity": 2},
+            {"transaction_id": "T2", "amount": None, "date": "2024-01-02", "quantity": 3},
+        ]
+        cleaned, _ = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
+        assert len(cleaned) == 1
+        assert cleaned[0].get("transaction_id") == "T1"
+
 
 # ── 8. ID-Like Text NOT Filled With Placeholder ─────────────────────────────
 
