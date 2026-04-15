@@ -182,6 +182,7 @@ def _process_structured_csv(
 
     memory_hit = False
     base_fm = classify_fields(columns)
+    valid_columns = {str(c).strip() for c in columns if c is not None and str(c).strip()}
     field_map: dict[str, list[str]] = {k: list(v) for k, v in base_fm.items() if v}
     schema_source = "heuristic"
 
@@ -190,6 +191,7 @@ def _process_structured_csv(
         field_map = merge_field_maps(
             base_fm,
             cached.get("field_map") or cached.get("mapping"),
+            valid_columns=valid_columns,
         )
         field_map = {k: v for k, v in field_map.items() if v}
         schema_source = str(cached.get("source") or "memory")
@@ -201,7 +203,7 @@ def _process_structured_csv(
 
                 ai = detect_schema_ai(sample, api_key)
                 ai_m = ai.get("mapping") or {}
-                merged = merge_field_maps(field_map, ai_m)
+                merged = merge_field_maps(field_map, ai_m, valid_columns=valid_columns)
                 if field_map_nonempty(merged):
                     field_map = {k: v for k, v in merged.items() if v}
                     schema_source = "ai"

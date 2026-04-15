@@ -127,7 +127,8 @@ def semantic_intelligence_row(
     used_norms = {normalize_field_name(str(c)) for cols in field_map.values() for c in cols}
 
     person_name = clean_name(sem.get("person_name"))
-    email = clean_email(sem.get("email"))
+    email_raw = sem.get("email")
+    email = clean_email(email_raw)
     phone = clean_phone(sem.get("phone"))
     location = normalize_city(sem.get("location"))
     status = normalize_status_value(sem.get("status"))
@@ -145,7 +146,8 @@ def semantic_intelligence_row(
 
     if person_name:
         rec["person_name"] = person_name
-    if email:
+    # Only create email field when source value is actually email-like.
+    if email and is_valid_email(email):
         rec["email"] = email
     if phone:
         rec["phone"] = phone
@@ -237,7 +239,7 @@ def coerce_intelligence_row(d: dict[str, Any]) -> dict[str, Any]:
         out.pop("name", None)
 
     em = clean_email(d.get("email"))
-    if em:
+    if em and is_valid_email(em):
         out["email"] = em
 
     ph = clean_phone(d.get("phone"))

@@ -13,6 +13,15 @@ from parsers.csv_parser import normalize_field_name
 
 logger = logging.getLogger(__name__)
 
+_INVALID_SOURCE_KEY_FRAGMENTS = (
+    "is_valid_",
+    "is_anomaly",
+    "confidence",
+    "__",
+    "imputed",
+    "metadata",
+)
+
 # Semantic roles (priority order for assignment: first match wins per column).
 # quantity is strictly separated from monetary amount / salary.
 _ROLE_SPECS: tuple[tuple[str, frozenset[str]], ...] = (
@@ -173,6 +182,13 @@ def _header_matches_keywords(norm_header: str, keywords: frozenset[str]) -> bool
     return False
 
 
+def _is_valid_source_column_name(col: str) -> bool:
+    nk = normalize_field_name(str(col))
+    if not nk:
+        return False
+    return not any(frag in nk for frag in _INVALID_SOURCE_KEY_FRAGMENTS)
+
+
 def classify_fields(columns: list[str]) -> dict[str, list[str]]:
     """
     Map semantic roles → list of original column names (each column assigned once).
@@ -186,6 +202,8 @@ def classify_fields(columns: list[str]) -> dict[str, list[str]]:
             continue
         orig = str(col).strip()
         if orig in used:
+            continue
+        if not _is_valid_source_column_name(orig):
             continue
         nk = normalize_field_name(orig)
         if not nk:
@@ -250,6 +268,8 @@ def dynamic_semantic_map(row: dict[str, Any], field_map: dict[str, Any]) -> dict
         if role == "amount_monetary":
             col_list = _sort_amount_columns(col_list)
         for c in col_list:
+            if not _is_valid_source_column_name(str(c)):
+                continue
             if c not in row:
                 continue
             v = row.get(c)
@@ -283,6 +303,8 @@ def _ai_role_aliases() -> dict[str, str]:
 def merge_field_maps(
     base: dict[str, list[str]],
     overlay: dict[str, Any] | None,
+    *,
+    valid_columns: set[str] | None = None,
 ) -> dict[str, list[str]]:
     """Union column lists per role; AI keys are aliased to internal roles."""
     out: dict[str, list[str]] = {k: list(v) for k, v in base.items()}
@@ -298,7 +320,13 @@ def merge_field_maps(
             if c is None:
                 continue
             s = str(c).strip()
-            if s and s not in out[role]:
+            if not s:
+                continue
+            if not _is_valid_source_column_name(s):
+                continue
+            if valid_columns is not None and s not in valid_columns:
+                continue
+            if s not in out[role]:
                 out[role].append(s)
     return out
 
