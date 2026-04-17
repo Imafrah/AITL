@@ -42,21 +42,6 @@ def _is_retryable_transport_error(exc: BaseException) -> bool:
     if "RESOURCE_EXHAUSTED" in msg or "UNAVAILABLE" in msg or "RATE LIMIT" in msg:
         return True
 
-    try:
-        from google.api_core import exceptions as gexc
-
-        if isinstance(
-            exc,
-            (
-                gexc.ResourceExhausted,
-                gexc.TooManyRequests,
-                gexc.ServiceUnavailable,
-            ),
-        ):
-            return True
-    except ImportError:
-        pass
-
     return False
 
 

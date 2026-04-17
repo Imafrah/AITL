@@ -10,3 +10,4 @@ google-genai
 thefuzz
 rapidfuzz
 pydantic
+google-api-core

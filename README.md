@@ -1,7 +1,7 @@
 <p align="center">
-  <h1 align="center">🧠 AITL — AI Data Translation Layer</h1>
+  <h1 align="center">🧠 AITL — Universal Data Intelligence Layer</h1>
   <p align="center">
-    <strong>Transform unstructured documents into AI-ready structured JSON — powered by Gemini</strong>
+    <strong>Transform unstructured and tabular data into high-fidelity structured intelligence — Powered by Hybrid AI/Rules + Dynamic Cleaning</strong>
   </p>
   <p align="center">
     <a href="https://aitl.vercel.app">Live Demo</a> · 
@@ -14,7 +14,7 @@
     <img src="https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=black" alt="React">
     <img src="https://img.shields.io/badge/Gemini_2.5_Flash-AI-8E75B2?style=flat-square&logo=google&logoColor=white" alt="Gemini">
     <img src="https://img.shields.io/badge/PostgreSQL-15+-4169E1?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL">
-    <img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
+    <img src="https://img.shields.io/badge/SQLite-Memory-003B57?style=flat-square&logo=sqlite&logoColor=white" alt="SQLite">
   </p>
 </p>
 
@@ -43,16 +43,18 @@
 
 ## 🌟 Overview
 
-**AITL (AI Data Translation Layer)** is a full-stack application that converts unstructured documents — invoices, reports, CSVs, and more — into clean, structured JSON using Google's **Gemini 2.5 Flash** AI model.
+**AITL (AI Data Translation Layer)** is a next-generation data intelligence platform that converts messy, unstructured documents and tabuar data into production-ready structured intelligence. 
 
-Upload a messy `.txt` invoice, a `.csv` sales report, or a `.pdf` document, and AITL will:
+By combining **Gemini 2.5 Flash** with a deterministic **Dynamic Cleaning Engine**, AITL ensures that your raw data is not just "translated," but cleaned, validated, and normalized for downstream consumption.
 
-1. **Parse** the raw file into clean text
-2. **Extract** entities (people, organizations, dates, amounts) with confidence scores
-3. **Post-process** the output with entity IDs, normalized labels, and relationship mapping
-4. **Persist** the structured result in a PostgreSQL database
+Upload a `.txt` invoice, a billion-row `.csv` (truncated), or a complex `.pdf`, and AITL will:
 
-The result is a standardized, AI-ready JSON output that can be consumed by downstream systems, dashboards, or other AI pipelines.
+1.  **Classify & Route**: Automatically detect if the file is an unstructured document or a tabular dataset.
+2.  **Intelligent Extraction**: Use hybrid AI techniques to extract semantic entities (Names, Dates, Locations, Amounts).
+3.  **Schema Memory**: Recognize recurring CSV schemas using SQLite-backed "memory" for consistent field mapping.
+4.  **Anomaly Detection**: Identify statistical outliers and data quality issues during the transformation.
+5.  **Final Cleaning Layer**: Enforce zero-null policies, perform type-repair, and unify schemas into a universal intelligence record.
+6.  **Multi-Format Export**: Persist results to PostgreSQL and provide on-demand JSON, CSV, Table, and TOML exports.
 
 ---
 
@@ -60,45 +62,56 @@ The result is a standardized, AI-ready JSON output that can be consumed by downs
 
 | Feature | Description |
 |---|---|
-| 📄 **Multi-format Parsing** | Supports `.txt`, `.csv`, and `.pdf` file formats |
-| 🤖 **AI Entity Extraction** | Extracts people, organizations, dates, and monetary amounts using Gemini 2.5 Flash |
-| 🎯 **Confidence Scoring** | Every extracted entity includes a confidence score (0.0–1.0) |
-| 🔗 **Relationship Detection** | Identifies relationships between entities (e.g., payment flows) |
-| 🏷️ **Entity ID Assignment** | Each entity gets a unique short ID (`p1`, `o1`, `d1`, `a1`) for cross-referencing |
-| 📊 **Label Normalization** | AI-generated labels are normalized to a standard vocabulary |
-| 🗄️ **Database Persistence** | Results are automatically saved to PostgreSQL with full traceability |
-| 🖥️ **React Dashboard** | Beautiful dark-themed UI to upload files and visualize results |
-| 🐳 **Docker Ready** | One-command deployment with Docker |
-| 📝 **Structured Logging** | Complete pipeline logging with timestamps and module names |
-| 🔒 **Input Validation** | File type, size (10MB max), and empty file checks |
-| ⚡ **Graceful Degradation** | Partial results returned if any pipeline step fails |
+| 📄 **Universal Parsing** | Supports `.txt`, `.csv`, and `.pdf` with robust, auto-detecting parsers |
+| 🤖 **Hybrid Extraction** | Combines Large Language Models (Gemini) with deterministic heuristics for maximum accuracy |
+| 🧠 **Schema Memory** | SQLite-backed cognitive layer that "remembers" previous CSV column mappings |
+| 🧼 **Dynamic Cleaning** | Automated type repair, date normalization, and "no-null" imputation policies |
+| 🚨 **Anomaly Detection** | Real-time statistical identification of outliers and suspicious data points |
+| 🎯 **Adaptive Confidence** | Confidence scores dynamically adjusted based on data quality and normalization state |
+| 🗄️ **PostgreSQL Store** | Results are automatically persisted for long-term auditability |
+| 🗳️ **Multi-Format Export** | On-demand export to **JSON**, **TOML**, **CSV**, and **Interactive Dashboard** |
+| 🖥️ **React Intelligence Lab** | Beautiful dark-themed dashboard to visualize the data intelligence pipeline |
+| 🐳 **Docker Ready** | One-command depl## 🏗 Architecture
 
----
-
-## 🏗 Architecture
-
+```mermaid
+graph TD
+    User([User/Client]) -->|Upload File| API[FastAPI Entry Point]
+    
+    subgraph "Universal Intelligence Pipeline"
+        API --> Classification{File Router}
+        Classification -->|Unstructured| AI[Gemini AI Extract]
+        Classification -->|Tabular| CSV[Robust CSV Parser]
+        
+        AI --> Normalization[Schema Normalization]
+        CSV --> Memory[(SQLite Schema Memory)]
+        Memory <--> CSV
+        
+        Normalization --> Cleaning[Cleaning & Validation]
+        CSV --> Cleaning
+        
+        Cleaning --> Anomaly[Anomaly Detection]
+        Anomaly --> Confidence[Adaptive Confidence]
+        Confidence --> FinalClearing[Final Cleaning Layer]
+    end
+    
+    FinalClearing --> DB[(PostgreSQL)]
+    FinalClearing --> Export{Export Formats}
+    
+    Export --> JSON[JSON/TOML]
+    Export --> DASH[React Dashboard]
+    Export --> CSVO[Clean CSV]
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     React Frontend (Vite)                    │
-│                   https://aitl.vercel.app                     │
-└─────────────────────┬───────────────────────────────────────┘
-                      │  POST /translate (multipart/form-data)
-                      ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   FastAPI Backend (Uvicorn)                   │
-│                  https://aitl.onrender.com                    │
-│                                                               │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │                   API Routes Layer                      │ │
-│  │         File validation · Size checks · Routing         │ │
-│  └────────────────────────┬────────────────────────────────┘ │
-│                           │                                  │
-│  ┌────────────────────────▼────────────────────────────────┐ │
-│  │                    Orchestrator                          │ │
-│  │          Manages the 4-step pipeline flow                │ │
-│  └──┬──────────┬────────────┬────────────┬─────────────────┘ │
-│     │          │            │            │                    │
-│     ▼          ▼            ▼            ▼                   │
+
+The pipeline follows a **7-stage hybrid flow** optimized for data integrity:
+
+1.  **Classify** → Route to AI extractor (TXT/PDF) or Robust Parser (CSV).
+2.  **Extract** → Gemini 2.5 Flash for entities or `csv.DictReader` for tabular.
+3.  **Remember** → (CSV only) Load/Save column mappings from SQLite memory.
+4.  **Clean** → Standardize dates, emails, phones, and currency.
+5.  **Detect** → Identify statistical anomalies and outliers.
+6.  **Score** → Compute adaptive confidence based on data quality.
+7.  **Unify** → Enforce zero-null policies and repair data types.
+�     ▼          ▼            ▼            ▼                   │
 │  ┌──────┐ ┌────────┐ ┌──────────┐ ┌──────────┐              │
 │  │Parse │ │  AI    │ │  Post    │ │ Database │              │
 │  │      │ │Extract │ │ Process  │ │  Save    │              │
@@ -126,13 +139,13 @@ The pipeline follows a **4-step sequential flow** with error handling at each st
 |---|---|
 | **Python 3.11** | Core runtime |
 | **FastAPI** | High-performance async API framework |
-| **Uvicorn** | ASGI server |
 | **Google Gemini 2.5 Flash** | AI model for entity extraction |
 | **SQLAlchemy** | ORM for database operations |
-| **PostgreSQL** | Persistent data store |
+| **PostgreSQL** | Dynamic result storage |
+| **SQLite (Memory)** | Persistent schema mapping retention |
 | **pdfplumber** | PDF text extraction |
-| **pandas** | CSV parsing and processing |
-| **python-dotenv** | Environment variable management |
+| **pandas / csv** | Robust tabular parsing |
+| **rapidfuzz** | Fuzzy string matching for cleaning |
 
 ### Frontend
 | Technology | Purpose |
@@ -169,52 +182,45 @@ These are deliberately excluded from v1:
 ```
 AITL/
 ├── main.py                    # FastAPI app entry point
-├── orchestrator.py            # 4-step pipeline orchestration
+├── orchestrator.py            # Legacy orchestrator (maintained for compatibility)
 ├── logger.py                  # Centralized logging configuration
 ├── requirements.txt           # Python dependencies
 ├── Dockerfile                 # Docker containerization
-├── .env                       # Environment variables (not committed)
-├── .gitignore                 # Git ignore rules
+├── schema_memory.db           # SQLite database for Schema Memory
+│
+├── core/                      # Pipeline Intelligence Layer
+│   ├── universal_pipeline.py  # Main hybrid pipeline entry
+│   ├── cleaning.py            # Basic data cleaning rules
+│   ├── final_cleaning.py      # Type repair & zero-null enforcement
+│   ├── schema_memory.py       # SQLite CRUD for CSV mappings
+│   ├── anomaly_detector.py    # Statistical outlier detection
+│   ├── analytics_engine.py    # Meta-analysis of extracted data
+│   ├── semantic_mapping.py    # Grouping raw columns into intelligence roles
+│   └── output_formatter.py    # Converters for Export formats
 │
 ├── api/                       # API Layer
-│   ├── __init__.py
-│   └── routes.py              # POST /translate, GET /results/{id}
+│   └── routes.py              # GET /translate, POST /export/toml
 │
 ├── parsers/                   # File Parsing Layer
-│   ├── __init__.py
 │   ├── router.py              # Routes files to correct parser
-│   ├── txt_parser.py          # Plain text parser
-│   ├── csv_parser.py          # CSV parser (via pandas)
-│   └── pdf_parser.py          # PDF parser (via pdfplumber)
+│   ├── csv_robust.py          # High-performance CSV parser
+│   ├── pdf_parser.py          # PDF parser (via pdfplumber)
+│   └── txt_parser.py          # Plain text parser
 │
 ├── ai_layer/                  # AI Extraction Layer
-│   ├── __init__.py
-│   └── extractor.py           # Gemini 2.5 Flash integration
+│   ├── extractor.py           # Gemini 2.5 Flash integration
+│   └── schema_detector.py     # AI-based column role detection
 │
 ├── post_processor/            # Post-Processing Layer
-│   ├── __init__.py
-│   └── processor.py           # Entity IDs, normalization, confidence
+│   └── processor.py           # Legacy entity IDs & ID normalization
 │
-├── db/                        # Database Layer
-│   ├── __init__.py
-│   ├── database.py            # SQLAlchemy engine, model, init
-│   └── crud.py                # Create & read operations
+├── db/                        # PostgreSQL Layer
+│   ├── database.py            # SQLAlchemy engine & model
+│   └── crud.py                # Persistence logic
 │
-├── sample_data/               # Example files for testing
-│   ├── invoice_001.txt        # Clean invoice
-│   ├── invoice_002.txt        # Ambiguous invoice (tests confidence)
-│   ├── sales_001.csv          # Sales data spreadsheet
-│   └── empty.txt              # Edge case: empty file
-│
-└── frontend/                  # React Frontend
-    ├── index.html             # HTML entry point
-    ├── package.json           # Node dependencies
-    ├── vite.config.js         # Vite config with API proxy
-    └── src/
-        ├── main.jsx           # React entry point
-        ├── App.jsx            # Main application component
-        ├── App.css            # Component styles
-        └── index.css          # Global styles & CSS variables
+└── frontend/                  # React Intelligence Dashboard
+    ├── App.jsx                # Multi-view dashboard (JSON/Table/Charts)
+    └── index.css              # Custom design system
 ```
 
 ---
