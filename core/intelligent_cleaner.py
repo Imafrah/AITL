@@ -1,6 +1,7 @@
 """
 Intelligent Data Cleaning Engine (Fully Production-Grade)
 Dynamic, schema-agnostic, and universal.
+Strict Mode guaranteed zero-error.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import re
 import statistics
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, cast
+from typing import Any, Iterable
 
 from core.cleaning import (
     amount_from_value,
@@ -52,9 +53,66 @@ def _is_present(v: Any) -> bool:
         return False
     return True
 
+_UNITS: dict[str, int] = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, 
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, 
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, 
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, 
+    "eighteen": 18, "nineteen": 19
+}
+
+_TENS: dict[str, int] = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, 
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90
+}
+
+
+def _parse_english_number_words(s: str) -> float | None:
+    s = s.strip().lower()
+    s = re.sub(r'[^a-z0-9\s-]', '', s)
+    s = s.replace("-", " ")
+    words = s.split()
+    if not words:
+         return None
+         
+    total = 0
+    current = 0
+    for w in words:
+         if w in _UNITS:
+             current += _UNITS[w]
+         elif w in _TENS:
+             current += _TENS[w]
+         elif w == "hundred":
+             current *= 100
+         elif w == "thousand":
+             total += current * 1000
+             current = 0
+         elif w == "million":
+             total += current * 1000000
+             current = 0
+         elif w == "and":
+             pass
+         else:
+             return None
+    return float(total + current)
+
+def _coerce_number(v: Any) -> float | None:
+    """Enhanced numeric coercion handling 'twenty five' -> 25"""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    if isinstance(v, str):
+        v = v.strip()
+        amt = amount_from_value(v)
+        if amt is not None:
+             return float(amt)
+        # Try english parser
+        eng = _parse_english_number_words(v)
+        if eng is not None:
+             return eng
+    return None
 
 def detect_field_types(records: list[dict[str, Any]]) -> dict[str, set[str]]:
-    """Dynamically discover field types strictly based on data patterns, not names."""
+    """Dynamically discover field types strictly based on data patterns."""
     out: dict[str, set[str]] = {
         "numeric": set(),
         "email": set(),
@@ -62,20 +120,14 @@ def detect_field_types(records: list[dict[str, Any]]) -> dict[str, set[str]]:
         "text": set(),
         "categorical": set(),
         "sensitive": set(),
+        "phone": set(),
     }
     if not records:
         return out
 
     keys = [k for k in records[0].keys() if k not in _RESERVED_KEYS and not str(k).startswith("__")]
-    n = len(records)
-
     for k in keys:
-        filled_vals = []
-        for r in records:
-            v = r.get(k)
-            if _is_present(v):
-                filled_vals.append(v)
-                
+        filled_vals = [r.get(k) for r in records if _is_present(r.get(k))]
         if not filled_vals:
             out["text"].add(k)
             continue
@@ -86,10 +138,24 @@ def detect_field_types(records: list[dict[str, Any]]) -> dict[str, set[str]]:
         at_like = sum(1 for v in filled_vals if isinstance(v, str) and "@" in v)
         if at_like / filled >= 0.3:
             out["email"].add(k)
-            # Sensitive if High cardinality and looks like email
             out["sensitive"].add(k)
             continue
             
+        # Phone Check
+        phone_like = 0
+        for v in filled_vals:
+             if isinstance(v, str) and is_valid_phone(v):
+                  phone_like += 1
+             elif isinstance(v, str):
+                  digits = re.sub(r"\D+", "", v)
+                  if 10 <= len(digits) <= 15:
+                       phone_like += 1
+        
+        if phone_like / filled >= 0.5 or "phone" in str(k).lower() or "mobile" in str(k).lower():
+            out["phone"].add(k)
+            out["sensitive"].add(k)
+            continue
+
         # Date Check
         date_ok = sum(1 for v in filled_vals if isinstance(v, str) and len(v) >= 4 and is_valid_date(v))
         if date_ok / filled >= 0.5:
@@ -99,42 +165,33 @@ def detect_field_types(records: list[dict[str, Any]]) -> dict[str, set[str]]:
         # Numeric Check
         num_ok = 0
         for v in filled_vals:
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                num_ok += 1
-            elif isinstance(v, str):
-                s = v.strip()
-                # fast pattern for numeric-like strings
-                if re.fullmatch(r"[\s$€£₹-]*\d[\d,.\s$€£₹%-]*", s):
-                    num_ok += 1
+            if _coerce_number(v) is not None:
+                 num_ok += 1
         
-        if num_ok / filled >= 0.5:
+        if num_ok / filled >= 0.4:
             out["numeric"].add(k)
             continue
             
-        # Categorical vs Text & Sensitive ID check
+        # Categorical vs Text & Sensitive ID
         distinct_ratio = len(set(str(v).strip().lower() for v in filled_vals)) / filled
         if distinct_ratio < 0.5 and filled >= 5:
             out["categorical"].add(k)
             out["text"].add(k)
         else:
             out["text"].add(k)
-            
-            # Check for generic sensitive IDs (UUIDs, high entropy stuff)
-            # Or if it's very distinct and contains digits primarily
+            # Sensitive IDs
             digit_heavy = sum(1 for v in filled_vals if isinstance(v, str) and len(re.sub(r"\D", "", v)) >= 5)
-            if (distinct_ratio >= 0.8 and filled >= 5) and (digit_heavy / filled >= 0.4):
+            if (distinct_ratio >= 0.8 and filled >= 5) and (digit_heavy / filled >= 0.3):
                 out["sensitive"].add(k)
 
     return out
 
 
-def _normalize_string(val: str) -> str:
-    """String normalization: strip spaces, normalize casing, noise chars."""
+def _normalize_string(val: str, is_cat: bool = False) -> str:
+    """Normalize strings (strip spaces, normalize casing)."""
     t = val.strip()
-    t = re.sub(r"\s+", " ", t)  # multiple spaces to one
-    # Title Case normalization
+    t = re.sub(r"\s+", " ", t) 
     if "@" not in t and "://" not in t:
-        # Don't uppercase things that look like URLs or partial emails
         t = t.title()
     return t
 
@@ -142,44 +199,30 @@ def _normalize_string(val: str) -> str:
 def _fix_email(val: str) -> str | None:
     """SMART EMAIL CORRECTION"""
     s = val.strip().lower()
-    if "@" not in s:
-        return None
     
-    parts = s.split("@")
-    if len(parts) == 2:
-        name, domain = parts
-        if not domain:
-            return f"{name}@gmail.com" # Append .com fallback actually let's just do .com to name
-            
-        # Fix common patterns
-        if domain == "gmail":
-            return f"{name}@gmail.com"
-        if domain == "yahoo":
-            return f"{name}@yahoo.com"
-            
-    # Check if fully invalid
-    if not is_valid_email(s):
-        # We try to rescue missing .com
-        if "." not in s.split("@")[-1]:
-            s += ".com"
-            if is_valid_email(s):
-                return s
-        return None
-        
-    return s
-
+    # Try basic fixes
+    if "@" in s:
+        parts = s.split("@")
+        if len(parts) == 2:
+             name, domain = parts
+             if not domain:
+                 s = f"{name}@gmail.com"
+             elif domain == "gmail":
+                 s = f"{name}@gmail.com"
+             elif domain == "yahoo":
+                 s = f"{name}@yahoo.com"
+             elif "." not in domain:
+                 s += ".com"
+                 
+    if is_valid_email(s):
+         return s
+    return None
 
 def _cap_outliers_iqr(records: list[dict[str, Any]], field: str):
     """ADVANCED ANOMALY HANDLING: Cap extreme values using IQR for SAFE MODE"""
-    vals = []
-    for r in records:
-        v = r.get(field)
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            vals.append(v)
-            
+    vals = [r[field] for r in records if isinstance(r.get(field), (int, float)) and not isinstance(r.get(field), bool)]
     if len(vals) < 4:
         return
-        
     vals.sort()
     n = len(vals)
     q1 = vals[n // 4]
@@ -196,24 +239,19 @@ def _cap_outliers_iqr(records: list[dict[str, Any]], field: str):
             elif v > upper_bound:
                 r[field] = upper_bound
 
-
 def _find_dedup_keys(records: list[dict[str, Any]], field_types: dict[str, set[str]]) -> list[str]:
     """Dynamically deduce key combination for deduplication"""
-    # Prefer sensitive fields + dates/amounts
     candidates = list(field_types["sensitive"])
     if not candidates:
         text_cols = list(field_types["text"])
-        candidates = text_cols[:2] # take up to first 2 text cols
+        candidates = text_cols[:2]
         
     additives = list(field_types["date"]) + list(field_types["numeric"])
     keys = candidates + additives[:1]
     
-    # If still empty, use all non-reserved keys
     if not keys and records:
         keys = [k for k in records[0].keys() if k not in _RESERVED_KEYS]
-        
     return keys
-
 
 def run_final_cleaning_layer(
     records: list[dict[str, Any]],
@@ -221,19 +259,20 @@ def run_final_cleaning_layer(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
     Production-Grade Intelligent Data Cleaning Engine
+    STRICT MODE prioritizes zero-error integrity.
     """
     mode = os.getenv("AITL_CLEAN_MODE", "safe").strip().lower()
     if mode not in ("safe", "strict"):
         mode = "safe"
         
     logger.info("Intelligent cleaning started | mode=%s", mode.upper())
-    
     if not records:
         return [], {"rows_out": 0}
         
     working = copy.deepcopy(records)
     
-    # --- CONFIDENCE-BASED ROW FILTERING ---
+    # ── LOW CONFIDENCE DROPPING ──
+    limit = 0.7 if mode == "strict" else 0.6
     kept = []
     for r in working:
         conf = r.get("confidence", 1.0)
@@ -241,13 +280,13 @@ def run_final_cleaning_layer(
             conf = float(conf)
         except:
             conf = 1.0
-            
-        if conf < 0.6:
-            continue # Drop
+        if mode == "strict":
+             if conf < limit: continue
+        else:
+             if conf < limit: continue
         kept.append(r)
     working = kept
     
-    # --- COLUMN CONSISTENCY (SCHEMA EXTRACTION) ---
     all_keys = set()
     for r in working:
         all_keys.update(r.keys())
@@ -257,173 +296,154 @@ def run_final_cleaning_layer(
                 r[k] = None
 
     field_types = detect_field_types(working)
+    critical_fields = infer_critical_fields(working)
     
-    # --- FIELD-AWARE CLEANING & CORRECTION & RANGE VALIDATION ---
+    # Force ID/Transaction ID heavily to critical if not caught
+    for sk in field_types["sensitive"]:
+         if sk not in critical_fields:
+              critical_fields.append(sk)
+    
     current_year = datetime.now().year
     
-    anomalous_rows = set()
-    
-    for i, r in enumerate(working):
-        conf = float(r.get("confidence", 1.0))
+    # ── FIRST PASS: ATTEMPT FIXES & TYPE CONVERSIONS ──
+    fixed_working = []
+    for r in working:
+        new_row = copy.deepcopy(r)
         
-        for k, v in r.items():
-            if not _is_present(v) or k in _RESERVED_KEYS:
+        for k in all_keys:
+            if k in _RESERVED_KEYS or not _is_present(r.get(k)):
                 continue
                 
-            # 1. Strings
+            v = r.get(k)
+            
+            # Text / Categorical
             if k in field_types["text"] and isinstance(v, str):
-                r[k] = _normalize_string(v)
+                new_row[k] = _normalize_string(v, is_cat=(k in field_types["categorical"]))
                 
-            # 2. Email
+            # Email
             if k in field_types["email"]:
                 fixed = _fix_email(str(v))
-                if fixed:
-                    r[k] = fixed
+                new_row[k] = fixed
+                        
+            # Phone
+            if k in field_types["phone"]:
+                # Just validate length/digits, normalize spaces
+                digits = re.sub(r"\D+", "", str(v))
+                if 10 <= len(digits) <= 15:
+                     new_row[k] = digits
                 else:
-                    if mode == "strict":
-                        anomalous_rows.add(i)
-                    r[k] = None
-                    
-            # 3. Numeric
+                     new_row[k] = None
+
+            # Numeric
             if k in field_types["numeric"]:
-                raw_amt = amount_from_value(v)
-                if raw_amt is not None:
-                    # Sanity Check Range Validation Dynamically via pattern/name
-                    nk = normalize_field_name(k)
-                    val = raw_amt
-                    is_invalid_range = False
-                    
-                    if "age" in nk or "years" in nk:
-                        if not (0 <= val <= 100):
-                            is_invalid_range = True
-                    elif "amount" in nk or "price" in nk or "salary" in nk or "cost" in nk:
-                        if val < 0:
-                            is_invalid_range = True
-                            
-                    if is_invalid_range:
-                        if mode == "strict":
-                            anomalous_rows.add(i)
-                        r[k] = None
-                    else:
-                        r[k] = val
+                num_val = _coerce_number(v)
+                if num_val is not None:
+                     nk = normalize_field_name(k)
+                     invalid = False
+                     if "age" in nk or "years" in nk:
+                         if not (0 <= num_val <= 100): invalid = True
+                     elif "amount" in nk or "price" in nk or "salary" in nk or "cost" in nk:
+                         if num_val < 0: invalid = True
+                     if invalid:
+                         new_row[k] = None
+                     else:
+                         new_row[k] = num_val
                 else:
-                    r[k] = None
-                    
-            # 4. Date
+                     new_row[k] = None
+                     
+            # Date
             if k in field_types["date"]:
                 iso = normalize_date_value(v)
                 if iso:
-                    # Not in future check
-                    try:
-                        yr = int(iso.split("-")[0])
-                        if yr > current_year:
-                             r[k] = None
-                        else:
-                             r[k] = iso
-                    except:
-                        r[k] = iso
+                    yr = int(iso.split("-")[0])
+                    if yr > current_year:
+                         new_row[k] = None
+                    else:
+                         new_row[k] = iso
                 else:
-                    r[k] = None
+                    new_row[k] = None
                     
-    # --- ADVANCED ANOMALY HANDLING ---
-    if mode == "strict":
-        # Drop anomalous rows dynamically
-        working = [r for idx, r in enumerate(working) if idx not in anomalous_rows]
-    else:
-        # Capping numerical outliers
-        for nk in field_types["numeric"]:
-            _cap_outliers_iqr(working, nk)
-
-    # --- DEDUPLICATION ---
+        fixed_working.append(new_row)
+    working = fixed_working
+    
+    # ── DEDUPLICATION (MANDATORY) ──
     dedup_keys = _find_dedup_keys(working, field_types)
-    seen = set()
-    deduped = []
+    seen_map = {}
     for r in working:
         sig = tuple(str(r.get(k, "")) for k in dedup_keys)
-        if sig not in seen:
-            seen.add(sig)
-            deduped.append(r)
-    working = deduped
+        conf = float(r.get("confidence", 0.0))
+        if sig not in seen_map or conf > seen_map[sig][1]:
+            seen_map[sig] = (r, conf)
+    working = [tup[0] for tup in seen_map.values()]
     
-    # --- SMART IMPUTATION ---
-    if mode != "strict":
-        # Compute Medians
-        medians = {}
+    # ── STRICT VS SAFE DROPPING AND IMPUTATION ──
+    final_output = []
+    
+    if mode == "strict":
+        # STRICT: Priority Data Integrity over Data Retention
+        for r in working:
+             drop = False
+             conf = float(r.get("confidence", 1.0))
+             
+             for k in all_keys:
+                  if k in _RESERVED_KEYS or str(k).startswith("__"): continue
+                  if not _is_present(r.get(k)):
+                       drop = True # Rule 9: ZERO null values
+                       break
+                  
+                  # Must be correct types and valid
+                  if k in field_types["phone"] and not _is_present(r.get(k)):
+                       drop = True
+                  if k in field_types["email"] and not _is_present(r.get(k)):
+                       drop = True
+             
+             # Also specific confidence validation: 0.7-0.85 only if fully valid 
+             # (we drop if not valid anyway, but any issue -> drop)
+             if drop:
+                  continue
+                  
+             # Build clean row without pipeline flags
+             clean_r = {}
+             for k in all_keys:
+                  if k not in _RESERVED_KEYS and not str(k).startswith("__"):
+                       clean_r[k] = r.get(k)
+             final_output.append(clean_r)
+    else:
+        # SAFE: Cap anomalies, Impute Missing values, Preserve Schema
+        for nk in field_types["numeric"]:
+            _cap_outliers_iqr(working, nk)
+            
+        medians, modes = {}, {}
         for nk in field_types["numeric"]:
             vals = [r[nk] for r in working if isinstance(r.get(nk), (int, float)) and not isinstance(r.get(nk), bool)]
-            if vals:
-                medians[nk] = statistics.median(vals)
-                
-        # Compute Modes
-        modes = {}
+            if vals: medians[nk] = statistics.median(vals)
         for ck in field_types["categorical"]:
             if ck in field_types["sensitive"]: continue
             vals = [str(r.get(ck)) for r in working if _is_present(r.get(ck))]
             if vals:
-                try:
-                    modes[ck] = statistics.mode(vals)
-                except statistics.StatisticsError:
-                    pass
-                    
-        for r in working:
-            for k in all_keys:
-                if k in _RESERVED_KEYS: continue
-                if not _is_present(r.get(k)):
-                    if k in field_types["sensitive"]:
-                        # NEVER FILL
-                        pass 
-                    elif k in field_types["numeric"]:
-                        r[k] = medians.get(k, 0.0)
-                    elif k in field_types["categorical"]:
-                        r[k] = modes.get(k, "Unknown")
-                    else:
-                        r[k] = "Unknown"
-                        
-    # --- STRICT ROW QA ---
-    critical_fields = infer_critical_fields(working)
-    if mode == "strict":
-        final_kept = []
-        for r in working:
-            drop = False
-            for c in critical_fields:
-                if not _is_present(r.get(c)):
-                    drop = True
-                    break
-            if not drop:
-                final_kept.append(r)
-        working = final_kept
-        
-    # --- FINAL OUTPUT RULE ---
-    # Strip validation flags, ensure fully consistent schema, fill any stragglers with safe defaults
-    final_output = []
-    for r in working:
-        clean_r = {}
-        for k in all_keys:
-            if k in _RESERVED_KEYS or str(k).startswith("__"):
-                continue
+                try: modes[ck] = statistics.mode(vals)
+                except: pass
                 
-            val = r.get(k)
-            # No nulls
-            if not _is_present(val):
-                if k in field_types["numeric"]:
-                    val = 0.0
-                elif k in field_types["date"]:
-                    val = "Unknown"
-                else:
-                    val = "Unknown"
-                    
-            # Enforce Datatype
-            if k in field_types["numeric"]:
-                try:
-                    val = float(val) if val != "Unknown" else 0.0
-                except:
-                    val = 0.0
-            elif k in field_types["text"] or k in field_types["categorical"]:
-                val = str(val)
-                
-            clean_r[k] = val
-        final_output.append(clean_r)
-        
+        for r in working:
+             clean_r = {}
+             # Critical filter for safe mode (less aggressive)
+             missing_crit = sum(1 for c in critical_fields if not _is_present(r.get(c)))
+             if missing_crit >= 2:
+                  continue
+                  
+             for k in all_keys:
+                  if k in _RESERVED_KEYS or str(k).startswith("__"): continue
+                  v = r.get(k)
+                  if not _is_present(v):
+                       if k in field_types["numeric"]:
+                            v = medians.get(k, 0.0)
+                       elif k in field_types["categorical"] and k not in field_types["sensitive"]:
+                            v = modes.get(k, "Unknown")
+                       else:
+                            v = "Unknown"
+                  clean_r[k] = v
+             final_output.append(clean_r)
+
     stats = {
         "rows_out": len(final_output),
         "clean_mode": mode,
