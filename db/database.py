@@ -28,9 +28,17 @@ class Document(Base):
     document_id = Column(String, primary_key=True)
     source_file = Column(String)
     document_type = Column(String)
-    status = Column(String)
+    status = Column(String) # processing, completed, failed
     raw_text = Column(Text)
     structured_output = Column(JSON)
+    error_message = Column(Text)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class SchemaMemory(Base):
+    __tablename__ = "schema_memory"
+    
+    signature = Column(String, primary_key=True)
+    mapping = Column(Text, nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 def init_db():

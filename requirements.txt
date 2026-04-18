@@ -11,3 +11,5 @@ thefuzz
 rapidfuzz
 pydantic
 google-api-core
+tenacity
+aiofiles

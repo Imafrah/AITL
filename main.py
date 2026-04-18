@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -25,9 +26,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,https://aitl.vercel.app")
+allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "https://aitl.vercel.app"],
+    allow_origins=allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
