@@ -25,7 +25,7 @@ from core.cleaning import (
     is_valid_salary,
 )
 from core.dashboard_formatter import build_dashboard
-from core.final_cleaning import detect_field_types, run_final_cleaning_layer, write_cleaning_outputs
+from core.intelligent_cleaner import detect_field_types, run_final_cleaning_layer, write_cleaning_outputs
 from core.file_router import route_file as classify_file
 from core.intelligence_record import coerce_intelligence_row, dedupe_intelligence_rows
 from core.output_formatter import to_table
@@ -65,15 +65,20 @@ def _is_numeric_like(v: Any) -> bool:
 
 
 def _build_validation_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
-    field_types = detect_field_types(rows) if rows else {"numeric": set(), "email": set(), "date": set()}
+    field_types = detect_field_types(rows) if rows else {"numeric": set(), "email": set(), "date": set(), "sensitive": set()}
     numeric_cols = set(field_types.get("numeric", set()))
     date_cols = set(field_types.get("date", set()))
-
+    email_cols = set(field_types.get("email", set()))
+    
     valid_numeric_cells = 0
+    valid_salary_cells = 0
     for r in rows:
         for k in numeric_cols:
-            if _is_numeric_like(r.get(k)):
+            val = r.get(k)
+            if _is_numeric_like(val):
                 valid_numeric_cells += 1
+                if is_valid_salary(val):
+                    valid_salary_cells += 1
 
     valid_date_rows = 0
     if date_cols:
@@ -82,15 +87,31 @@ def _build_validation_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
                 valid_date_rows += 1
     else:
         valid_date_rows = len(rows)
+        
+    valid_email_count = 0
+    if email_cols:
+        for r in rows:
+            if any(is_valid_email(r.get(k)) for k in email_cols):
+                valid_email_count += 1
+                
+    # Detect phone dynamically (heuristic inside validation)
+    phone_cols = set()
+    if rows:
+        for k in rows[0].keys():
+            if k in field_types.get("sensitive", set()) or "phone" in str(k).lower():
+                phone_cols.add(k)
+                
+    valid_phone_count = 0
+    if phone_cols:
+         for r in rows:
+             if any(is_valid_phone(r.get(k)) for k in phone_cols):
+                 valid_phone_count += 1
 
     return {
-        "valid_email_count": sum(1 for r in rows if is_valid_email(r.get("email"))),
-        "valid_phone_count": sum(1 for r in rows if is_valid_phone(r.get("phone"))),
-        "valid_salary_count": sum(
-            1 for r in rows if is_valid_salary(r.get("salary") or r.get("amount"))
-        ),
+        "valid_email_count": valid_email_count,
+        "valid_phone_count": valid_phone_count,
+        "valid_salary_count": valid_salary_cells,
         "valid_date_count": valid_date_rows,
-        # Count valid numeric cells (dynamic numeric columns), not stale pre-clean row flags.
         "valid_numeric_count": valid_numeric_cells,
     }
 
