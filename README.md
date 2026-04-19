@@ -240,6 +240,27 @@ AITL handles aggressive noise and varied errors within datasets. Our Dynamic Cle
 
 ---
 
+## 🛡️ System Robustness & Architecture Resilience
+
+AITL is explicitly engineered defensively for production-grade resilience and failure tolerance across all operational layers:
+
+### 1. Memory and Size Resilience (OOM Protection)
+- **Asynchronous Chunking:** The FastAPI endpoints read inbound bytes asynchronously (`await file.read(1MB)`) with strict memory caps parameterization. This prevents rogue payloads from starving the host machine.
+- **Data Capping:** To prevent infinite allocation loops, tabular processing enforces hard row truncations (`AITL_MAX_CSV_ROWS = 100000`), and raw AI-parsing strings are sliced safely via `MAX_AI_CHARS`.
+
+### 2. Database & State Safety
+- **Transaction Protections:** All metadata persistence wraps SQLAlchemy transactions inside `try-except-finally` blocks, firing `db.rollback()` on data inconsistencies and rigorously closing sessions to eliminate connection leaking.
+- **Schema Caching:** AITL shields downstream Gemini APIs from rate limits by persisting repetitive table schemas to a local `SQLite` memory cache.
+
+### 3. Safe API Degradation (Fallback Strategies)
+- **Isolated AI Failures:** Rather than dropping HTTP requests when an LLM fails, encounters limits, or corrupts JSON, AITL captures the `AIServiceError` and fires a secondary heuristic extractor, guaranteeing users receive available intelligence.
+- **Non-Blocking Threads:** Computationally heavy cleaning steps dynamically yield to worker threads (`asyncio.to_thread`), preventing CPU lockup on FastAPI's core event loops. 
+
+### 4. Poisonous Data Handling
+- **Error Mapping:** Internal parser crashes appropriately map exceptions internally (e.g., `CSVParsingError` routing gracefully to HTTP 422), enabling graceful UI recovery rather than silent crashes.
+
+---
+
 ## ❌ Out of Scope
 
 The current implementation limits itself purposely across certain aspects to guarantee quality via restricted scope:
