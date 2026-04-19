@@ -555,7 +555,7 @@ def process_universal(
     if final_status == "failed" and data:
         final_status = "partial"
 
-    cleaned_data, cleaning_stats = run_final_cleaning_layer(data)
+    cleaned_data, cleaning_stats = run_final_cleaning_layer(data, api_key=api_key)
     # Validation must reflect the cleaned output to avoid contradictory metadata.
     validation_summary = _build_validation_summary(cleaned_data)
     critical_for_metadata = cleaning_stats.get("critical_fields_detected") or infer_critical_fields(

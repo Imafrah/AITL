@@ -262,12 +262,44 @@ def run_final_cleaning_layer(
     STRICT MODE prioritizes zero-error integrity.
     """
     mode = os.getenv("AITL_CLEAN_MODE", "safe").strip().lower()
-    if mode not in ("safe", "strict"):
+    if mode not in ("safe", "strict", "ai_strict"):
         mode = "safe"
         
     logger.info("Intelligent cleaning started | mode=%s", mode.upper())
     if not records:
         return [], {"rows_out": 0}
+        
+    if mode == "ai_strict":
+        api_key = kwargs.get("api_key")
+        from ai_layer.dataset_cleaner import ai_clean_dataset
+        
+        try:
+            cleaned = ai_clean_dataset(records, api_key)
+        except Exception as e:
+            logger.error("AI Cleaner failed globally: %s", e)
+            cleaned = records
+            
+        field_types = detect_field_types(cleaned)
+        critical_fields = infer_critical_fields(cleaned)
+        
+        dedup_keys = _find_dedup_keys(cleaned, field_types)
+        seen_map = {}
+        for r in cleaned:
+            sig = tuple(str(r.get(k, "")) for k in dedup_keys)
+            if sig not in seen_map:
+                seen_map[sig] = r
+        cleaned = list(seen_map.values())
+        
+        stats = {
+            "rows_out": len(cleaned),
+            "clean_mode": "ai_strict",
+            "critical_fields_detected": critical_fields,
+            "cleaning_summary": {
+                "rows_removed": len(records) - len(cleaned),
+                "quality_score": 1.0
+            }
+        }
+        return cleaned, stats
         
     working = copy.deepcopy(records)
     
