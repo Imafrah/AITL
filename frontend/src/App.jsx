@@ -112,7 +112,7 @@ export default function App() {
               type="file"
               accept=".txt,.csv,.pdf"
               onChange={handleChange}
-              className="file-input-hidden"
+              style={{ display: 'none' }}
             />
             <div className="upload-icon">💾</div>
             <h3 style={{ fontSize: '1.5rem', marginBottom: '0.5rem', fontWeight: 800 }}>
