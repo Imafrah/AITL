@@ -12,7 +12,7 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [responseFormat, setResponseFormat] = useState("json")
-  // For drag and drop visuals
+  
   const [dragActive, setDragActive] = useState(false)
   const fileInputRef = useRef(null)
 
@@ -72,7 +72,7 @@ export default function App() {
       })
       setResult(res.data)
     } catch (err) {
-      setError(err.response?.data?.detail || "Something went wrong.")
+      setError(err.response?.data?.detail || "System Error: Something went wrong.")
     } finally {
       setLoading(false)
     }
@@ -82,168 +82,179 @@ export default function App() {
   const hasUniversalEnvelope = Boolean(result?.document_id && Array.isArray(rows))
 
   return (
-    <div className="app-wrapper animate-fade-in">
-      <header className="header">
-        <h1 className="title">AITL Engine</h1>
-        <p className="subtitle">Universal File Intelligence & Next-Gen Data Cleaning</p>
-      </header>
-
-      <section className="glass-panel">
-        <div 
-          className={`upload-zone ${dragActive ? 'drag-active' : ''}`}
-          onDragEnter={handleDrag}
-          onDragLeave={handleDrag}
-          onDragOver={handleDrag}
-          onDrop={handleDrop}
-          onClick={() => fileInputRef.current?.click()}
-        >
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".txt,.csv,.pdf"
-            onChange={handleChange}
-            className="file-input-hidden"
-          />
-          <div className="upload-icon">✦</div>
-          <h3 style={{ fontSize: '1.2rem', marginBottom: '0.5rem' }}>
-            {file ? file.name : 'Drag & Drop Dataset'}
-          </h3>
-          <p style={{ color: 'var(--text-secondary)' }}>
-            {file ? "File ready for extraction" : "Supports .CSV, .TXT, .PDF"}
-          </p>
+    <div className="app-wrapper">
+      {/* Fake Mac OS Window Title Bar */}
+      <div className="window-title-bar">
+        <div className="window-close-btn"></div>
+        <div className="window-title-bar-content">
+          System Window
         </div>
+      </div>
+      
+      <div className="window-body">
+        <header>
+          <h1 className="title">AITL Engine</h1>
+          <p className="subtitle">System 7.0 // Next-Gen Data Processing</p>
+        </header>
 
-        <div className="upload-controls">
-          <div>
-            <label style={{ display: 'none' }}>Response</label>
-            <select
-              value={responseFormat}
-              onChange={(e) => setResponseFormat(e.target.value)}
-              className="styled-select"
-            >
-              <option value="json">Format: JSON (Full Envelope)</option>
-              <option value="table">Format: JSON + Flattened Table</option>
-              <option value="dashboard">Format: Dashboard Analytics</option>
-              <option value="csv">Action: Direct CSV Download</option>
-            </select>
-          </div>
-          <button
-            onClick={handleUpload}
-            disabled={!file || loading}
-            className="btn-primary"
+        <section>
+          <div 
+            className={`upload-zone ${dragActive ? 'drag-active' : ''}`}
+            onDragEnter={handleDrag}
+            onDragLeave={handleDrag}
+            onDragOver={handleDrag}
+            onDrop={handleDrop}
+            onClick={() => fileInputRef.current?.click()}
+            style={{ position: 'relative' }}
           >
-            {loading ? (
-              <><span className="loader-ring"></span> Processing...</>
-            ) : "Extract Intelligence ⚡"}
-          </button>
-        </div>
-
-        {error && (
-          <div className="error-msg animate-fade-in">
-            <span>⚠️</span> {error}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".txt,.csv,.pdf"
+              onChange={handleChange}
+              className="file-input-hidden"
+            />
+            <div className="upload-icon">💾</div>
+            <h3 style={{ fontSize: '1.5rem', marginBottom: '0.5rem', fontWeight: 800 }}>
+              {file ? file.name : 'INSERT DISK OR DROP FILE'}
+            </h3>
+            <p style={{ fontWeight: 600 }}>
+              {file ? "Ready to compute" : "Supports .CSV, .TXT, .PDF formats"}
+            </p>
           </div>
-        )}
-      </section>
 
-      {result && typeof result === "object" && !Array.isArray(result) && hasUniversalEnvelope && (
-        <section className="results-container animate-fade-in" style={{ marginTop: '3rem' }}>
-          
-          <div className="results-header">
-            <div>
-              <h2 className="title" style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>Intelligence Report</h2>
-              <span style={{ color: 'var(--text-secondary)' }}>Generated for ID: {result.document_id}</span>
+          <div className="upload-controls" style={{ marginTop: '2rem' }}>
+            <div style={{ flex: 1 }}>
+              <label style={{ display: 'none' }}>Response</label>
+              <select
+                value={responseFormat}
+                onChange={(e) => setResponseFormat(e.target.value)}
+                className="styled-select"
+                style={{ width: '100%' }}
+              >
+                <option value="json">Format: JSON (Full Envelope)</option>
+                <option value="table">Format: JSON + Flattened Table</option>
+                <option value="dashboard">Format: Dashboard Analytics</option>
+                <option value="csv">Action: Direct CSV Download</option>
+              </select>
             </div>
-            <div className="status-badges">
-              <span className={`badge ${
-                result.status === "success" ? "success"
-                : result.status === "partial" ? "warning" : "error"
-              }`}>
-                {String(result.status ?? "unknown").toUpperCase()}
-              </span>
-              <span className="badge info">TYPE: {result.document_type}</span>
-            </div>
-          </div>
-
-          <h2 className="section-title">Cleaned Data ({rows.length} records)</h2>
-          <DataPreview rows={rows} />
-
-          {result.table && (
-            <>
-              <h2 className="section-title">Flattened Dimensions</h2>
-              <DataPreview rows={result.table} />
-            </>
-          )}
-
-          <h2 className="section-title">Execution Metadata</h2>
-          <div className="glass-panel" style={{ padding: '0', overflow: 'hidden' }}>
-            <table className="premium-table">
-              <tbody>
-                {Object.entries(result.metadata || {}).map(([k, v]) => (
-                  <tr key={k}>
-                    <td style={{ width: '30%', color: 'var(--accent-cyan)' }}>{k}</td>
-                    <td>{typeof v === "object" && v !== null ? JSON.stringify(v) : String(v)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <h2 className="section-title">Raw JSON Schema Output</h2>
-          <div style={{ display: "flex", gap: '1rem', marginBottom: '1.5rem' }}>
             <button
-              onClick={() => {
-                const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" })
-                const url = URL.createObjectURL(blob)
-                const a = document.createElement("a")
-                a.href = url
-                a.download = `${result.document_id}.json`
-                a.click()
-                URL.revokeObjectURL(url)
-              }}
-              className="btn-secondary"
+              onClick={handleUpload}
+              disabled={!file || loading}
+              className="btn-primary"
             >
-              ⬇ Download JSON
+              {loading ? (
+                <><span className="retro-loader">█</span> COMPUTING...</>
+              ) : "EXECUTE"}
             </button>
-            <button
-              onClick={async () => {
-                try {
-                  const res = await axios.post(`${API_BASE}/export/toml`, result, {
-                    responseType: "blob",
-                  })
-                  const url = URL.createObjectURL(res.data)
+          </div>
+
+          {error && (
+            <div className="error-msg" style={{ marginTop: '1.5rem' }}>
+              <span>⚠️</span> {error}
+            </div>
+          )}
+        </section>
+
+        {result && typeof result === "object" && !Array.isArray(result) && hasUniversalEnvelope && (
+          <section className="results-container" style={{ marginTop: '2rem', borderTop: '4px solid #000', paddingTop: '2rem' }}>
+            
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '2rem', flexWrap: 'wrap', gap: '1rem' }}>
+              <div>
+                <h2 className="title" style={{ fontSize: '2rem', marginBottom: '0' }}>REPORT</h2>
+                <strong style={{ display: 'block', fontSize: '0.9rem', marginTop: '0.5rem' }}>ID: {result.document_id}</strong>
+              </div>
+              <div className="status-badges">
+                <div className="badge">
+                  STATUS: {String(result.status ?? "UNKNOWN")}
+                </div>
+                <div className="badge">
+                  TYPE: {result.document_type}
+                </div>
+              </div>
+            </div>
+
+            <h2 className="section-title">CLEANED DATA ({rows.length} records)</h2>
+            <DataPreview rows={rows} />
+
+            {result.table && (
+              <>
+                <h2 className="section-title">FLATTENED DIMENSIONS</h2>
+                <DataPreview rows={result.table} />
+              </>
+            )}
+
+            <h2 className="section-title">METADATA</h2>
+            <div className="table-wrapper">
+              <table className="retro-table">
+                <tbody>
+                  {Object.entries(result.metadata || {}).map(([k, v]) => (
+                    <tr key={k}>
+                      <th style={{ width: '30%', backgroundColor: '#fff' }}>{k}</th>
+                      <td>{typeof v === "object" && v !== null ? JSON.stringify(v) : String(v)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <h2 className="section-title">RAW OUTPUT</h2>
+            <div style={{ display: "flex", gap: '1rem', marginBottom: '1.5rem' }}>
+              <button
+                onClick={() => {
+                  const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" })
+                  const url = URL.createObjectURL(blob)
                   const a = document.createElement("a")
                   a.href = url
-                  a.download = `${result.document_id ?? "export"}.toml`
+                  a.download = `${result.document_id}.json`
                   a.click()
                   URL.revokeObjectURL(url)
-                } catch {
-                  alert("Failed to download TOML")
-                }
-              }}
-              className="btn-secondary"
-            >
-              ⬇ Download TOML
-            </button>
-          </div>
-          <pre className="code-block">
-            {JSON.stringify(result, null, 2)}
-          </pre>
+                }}
+                className="btn-secondary"
+              >
+                [ SAVE JSON ]
+              </button>
+              <button
+                onClick={async () => {
+                  try {
+                    const res = await axios.post(`${API_BASE}/export/toml`, result, {
+                      responseType: "blob",
+                    })
+                    const url = URL.createObjectURL(res.data)
+                    const a = document.createElement("a")
+                    a.href = url
+                    a.download = `${result.document_id ?? "export"}.toml`
+                    a.click()
+                    URL.revokeObjectURL(url)
+                  } catch {
+                    alert("System Error: Failed to download TOML")
+                  }
+                }}
+                className="btn-secondary"
+              >
+                [ SAVE TOML ]
+              </button>
+            </div>
+            <pre className="code-block">
+              {JSON.stringify(result, null, 2)}
+            </pre>
 
-        </section>
-      )}
+          </section>
+        )}
+      </div>
     </div>
   )
 }
 
 function DataPreview({ rows }) {
   if (!rows?.length) {
-    return <p style={{ color: "var(--text-secondary)", fontStyle: 'italic' }}>No rows to display.</p>
+    return <p style={{ fontWeight: 'bold' }}>NO RECORDS FOUND.</p>
   }
   const keys = [...new Set(rows.flatMap((r) => Object.keys(r)))]
   
   return (
-    <div className="table-wrapper animate-fade-in">
-      <table className="premium-table">
+    <div className="table-wrapper">
+      <table className="retro-table">
         <thead>
           <tr>
             {keys.map((k) => (
