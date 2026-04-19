@@ -20,6 +20,7 @@
 
 - [Overview](#-overview)
 - [Features](#-features)
+- [Real-World Use Cases](#-real-world-use-cases)
 - [Architecture](#-architecture)
 - [Tech Stack](#-tech-stack)
 - [Project Structure](#-project-structure)
@@ -53,6 +54,28 @@ Upload a `.txt` invoice, a `.csv` dump, or a `.pdf` file, and AITL will:
 - **Schema Memory:** Backed by SQLite to remember and map recurring CSV columns, saving tokens and mapping structures.
 - **Dynamic Cleaning & Anomaly Detection:** Applies automated zero-null policies, type-repairs, and identifies outliers.
 - **Persistent Storage:** Fully integrated with `PostgreSQL` via `SQLAlchemy`.
+
+---
+
+## 🌍 Real-World Use Cases
+
+AITL solves the massive "Dark Data Ingestion" problem across several industries by acting as a universal translator that turns human-readable garbage into machine-readable structures:
+
+### 1. Finance & Accounting Automation
+* **Scenario:** Processing thousands of differently-formatted `.pdf` invoices.
+* **Solution:** AITL fires the messy invoice to Gemini to semantically rip out entities like Names, Organizations, and Amounts, exporting a clean tabular `.csv` ready for automated accounting software.
+
+### 2. CRM & Lead Data Standardization
+* **Scenario:** A sales team buys lists from disparate marketing agencies where one list uses `$120.5k` and `T/F`, and another uses `120500` and `Yes/No`.
+* **Solution:** The *Universal Data Standardizer* dynamically coerces strings and cleans integers/booleans across columns, preventing databases from throwing `Type Errors` when importing.
+
+### 3. Corporate Mergers & Data Migrations
+* **Scenario:** Normalizing an acquired company's legacy database dump where data is frequently `N/A`, `---`, or corrupted.
+* **Solution:** AITL enforces a *zero-imputation policy*, intentionally identifying and dropping garbage records rather than guessing, saving hours of data engineering cleanup tasks.
+
+### 4. Real-Time Analytics Dashboarding
+* **Scenario:** Business Managers want to understand complex table dumps without awaiting data-science interventions.
+* **Solution:** Using the `dashboard` endpoint, AITL returns an aggregated JSON payload yielding pre-calculated metrics along with the cleaned CSV records immediately.
 
 ---
 
