@@ -152,7 +152,7 @@ pip install -r requirements.txt
 
 Create a `.env` file in the root based on the required settings (see **Environment Variables** below).
 
-### 3. Run the API Server
+### 3. Run Locally (Without Docker)
 ```bash
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
@@ -160,6 +160,23 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 The API will now be available on: `http://localhost:8000`
 
 Interactive Documentation is at: `http://localhost:8000/docs`
+
+### 4. 🐳 Docker Deployment
+
+AITL provides a fully containerized architecture using Docker and Docker Compose, covering both the FastAPI backend and the Vite frontend.
+
+**Build and Run**
+Execute the following from the root directory:
+```bash
+docker-compose up --build -d
+```
+
+**Accessing Services:**
+- **Frontend Dashboard**: `http://localhost:80`
+- **Backend API**: `http://localhost:8000`
+- **Interactive API Docs**: `http://localhost:8000/docs`
+
+Volumes strictly mount `sample_data/`, `output/`, and the `schema_memory.db` for state persistence and seamless file processing.
 
 ---
 
@@ -205,8 +222,21 @@ JSON object containing pipeline output (cleansed structures, entities, anomaly f
 ### 1. Robust CSV Reading 
 Instead of delegating massive files completely over AI API tokens, the application strictly uses local `pandas` or python `csv` dictionaries paired with an SQLite cognitive memory layer to maintain schema consistencies without large LLM latencies.
 
-### 2. Universal Data Standardizer
+### 2. Universal Data Standardizer & Strict Cleaning
 Using `rapidfuzz` and python typing guards, data columns indicating `prices`, `dates`, or `booleans` are correctly cast dynamically in runtime, catching dirty artifacts along process pathways before pushing to Db.
+
+### 3. 🧹 Cleaning Dirty Datasets: Overview & Mechanisms
+AITL handles aggressive noise and varied errors within datasets. Our Dynamic Cleaning Engine operates on a **strict "zero-imputation" policy**, prioritizing data integrity mathematically and logically.
+
+**Types of Dirty Data We Clean:**
+- **Missing & Anomalous Values:** Inconsistent missing values such as `NaN`, `N/A`, `---`, `null`, `None`, or whitespace blocks.
+- **Type Inconsistencies:** Strings nested in numeric schemas (`$1200.50`, `1.2k`), localized boolean structures (`yes/no`, `1/0`, `T/F`), and disjointed date signatures.
+- **Garbage & Intermediaries:** AI-generated artifacts, raw JSON leftover bits, and schema deduction tokens within structural columns.
+
+**The Basis of Our Cleaning (How it Works):**
+1. **Dynamic Type Coercion:** Values are aggressively type-cast utilizing a mixture of regular expressions and contextual AI evaluation to resolve strings into actionable floats, integers, or booleans.
+2. **Zero-Imputation (No Nulls Policy):** The pipeline explicitly **does not guess**. If a field falls short of strict validation bounds or ends up devoid of substance, we do not impute a fallback. Rather, the entire record is safely **dropped** from the schema to assure 100% downstream validity.
+3. **Outlier Filtering & Metadata Stripping:** Extraneous validation columns (`_anomaly_score`, flags) generated mid-pipeline are pruned, and values behaving outside threshold standard limits are filtered out.
 
 ---
 
