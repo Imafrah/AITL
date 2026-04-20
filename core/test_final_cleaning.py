@@ -416,9 +416,9 @@ class TestOutputModes:
     def test_strict_mode_removes_low_quality(self):
         """STRICT mode should remove rows with >25% missing data."""
         records = [
-            {"name": "Alice", "a": 1, "b": 2, "c": 3, "d": 4},
-            {"name": "Bob", "a": None, "b": None, "c": 3, "d": 4},  # 40% missing → removed
-            {"name": "Carol", "a": 1, "b": 2, "c": 3, "d": 4},
+            {"name": "Alice", "role": "admin", "status": "active", "a": 1, "b": 2, "c": 3, "d": 4},
+            {"name": "Bob", "role": "user", "status": "inactive", "a": None, "b": None, "c": 3, "d": 4},
+            {"name": "Carol", "role": "user", "status": "active", "a": 1, "b": 2, "c": 3, "d": 4},
         ]
         cleaned, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
         assert stats["low_quality_removed"] >= 1, "Strict mode should remove low-quality rows"
@@ -494,9 +494,9 @@ class TestOutputModes:
     def test_strict_numeric_must_be_present(self):
         """STRICT mode requires numeric fields to be present."""
         records = [
-            {"name": "A", "email": "a@t.com", "dept": "Eng", "score": 90, "grade": 85, "rank": 1},
-            {"name": "B", "email": "b@t.com", "dept": "Mkt", "score": None, "grade": None, "rank": None},
-            {"name": "C", "email": "c@t.com", "dept": "Eng", "score": 88, "grade": 80, "rank": 3},
+            {"name": "A", "email": "a@t.com", "dept": "Eng", "role": "admin", "status": "active", "score": 90, "grade": 85, "rank": 1},
+            {"name": "B", "email": "b@t.com", "dept": "Mkt", "role": "user", "status": "inactive", "score": None, "grade": None, "rank": None},
+            {"name": "C", "email": "c@t.com", "dept": "Eng", "role": "user", "status": "active", "score": 88, "grade": 80, "rank": 3},
         ]
         cleaned, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
         # Row B has 0/3 numeric fields → should be removed
