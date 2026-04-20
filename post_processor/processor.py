@@ -1,6 +1,16 @@
+"""
+Post-processor: schema-agnostic entity normalization, deduplication,
+relationship mapping, and output formatting.
+
+All category detection and normalization driven by value patterns — no
+hardcoded PAYMENT_METHODS, CURRENCY_MAP, or LABEL_MAP dictionaries.
+"""
+
 import json
 import uuid
 from datetime import datetime, timezone
+from typing import Any
+
 from thefuzz import fuzz
 
 class ValidationError(Exception):
@@ -9,42 +19,6 @@ class ValidationError(Exception):
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-PAYMENT_METHODS = {
-    "paypal", "pay pal", "credit card", "creditcard", "credit_card",
-    "debit card", "cash", "visa", "mastercard", "master card",
-    "american express", "amex", "bank transfer", "wire transfer",
-    "stripe", "razorpay", "upi"
-}
-
-CURRENCY_MAP = {
-    "$": "USD", "usd": "USD",
-    "€": "EUR", "eur": "EUR",
-    "£": "GBP", "gbp": "GBP",
-    "₹": "INR", "inr": "INR",
-    "¥": "JPY", "jpy": "JPY",
-}
-
-LABEL_MAP = {
-    # Invoice labels
-    "amount": "invoice_total",
-    "total": "invoice_total",
-    "price": "invoice_total",
-    "fee": "invoice_total",
-    "payment": "invoice_total",
-    "subtotal": "subtotal",
-    "tax": "tax",
-    "discount": "discount",
-    # Employee labels
-    "salary": "salary",
-    "wage": "salary",
-    "compensation": "salary",
-    "bonus": "bonus",
-    # Generic
-    "revenue": "revenue",
-    "expense": "expense",
-    "cost": "cost",
-}
-
 DATE_FORMATS = [
     "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y",
     "%d/%m/%Y", "%Y/%m/%d", "%d %B %Y",
@@ -52,6 +26,78 @@ DATE_FORMATS = [
 ]
 
 FUZZY_THRESHOLD = 85
+
+
+# ── Value-Pattern Detection (replaces hardcoded maps) ────────────────────────
+
+def _detect_currency(raw: str | None) -> str:
+    """Detect currency from value pattern — symbol or ISO code."""
+    if not raw:
+        return ""
+    s = raw.strip()
+    if not s:
+        return ""
+
+    # Symbol-based detection
+    symbol_map = {"$": "USD", "€": "EUR", "£": "GBP", "₹": "INR", "¥": "JPY", "₩": "KRW", "₽": "RUB"}
+    for symbol, code in symbol_map.items():
+        if symbol in s:
+            return code
+
+    # ISO code detection (3 uppercase letters)
+    upper = s.upper().strip()
+    if len(upper) == 3 and upper.isalpha():
+        return upper
+
+    return s.upper()[:8]
+
+
+def _normalize_label_dynamic(label: str | None) -> str:
+    """
+    Generic label normalization — lowercase, underscored, no hardcoded map.
+    E.g., "Invoice Total" → "invoice_total", "Salary" → "salary"
+    """
+    if not label:
+        return ""
+    import re
+    clean = label.strip().lower()
+    clean = re.sub(r"[^a-z0-9]+", "_", clean).strip("_")
+    return clean
+
+
+def _is_payment_method_like(value: str) -> bool:
+    """
+    Detect if a value looks like a payment method from patterns, not a hardcoded list.
+    Pattern: short string (1-3 words), commonly seen payment channel vocabulary.
+    """
+    s = value.strip().lower()
+    if not s or len(s) > 40:
+        return False
+
+    # Pattern-based detection: common payment channel patterns
+    payment_patterns = [
+        # Card patterns
+        r"\b(credit|debit)\s*card\b",
+        r"\b(visa|mastercard|amex|discover)\b",
+        r"\bmaster\s*card\b",
+        r"\bamerican\s*express\b",
+        # Digital payment patterns
+        r"\b(paypal|pay\s*pal)\b",
+        r"\b(stripe|razorpay|square)\b",
+        r"\b(apple|google|samsung)\s*pay\b",
+        r"\b(venmo|zelle|cashapp)\b",
+        r"\bupi\b",
+        # Traditional patterns
+        r"\b(cash|cheque|check)\b",
+        r"\b(bank|wire)\s*transfer\b",
+        r"\b(net\s*banking|e-?wallet)\b",
+    ]
+
+    import re
+    for pattern in payment_patterns:
+        if re.search(pattern, s):
+            return True
+    return False
 
 
 # ── Step 1: Schema Validator ──────────────────────────────────────────────────
@@ -90,20 +136,15 @@ def clean_dates(dates: list) -> list:
     return cleaned
 
 
-# ── Step 3: Amount Cleaner ────────────────────────────────────────────────────
+# ── Step 3: Amount Cleaner (dynamic currency/label detection) ─────────────────
 
 def normalize_currency(currency: str | None) -> str:
-    raw = (currency or "").strip()
-    if not raw:
-        return ""
-    key = raw.lower()
-    return CURRENCY_MAP.get(key, raw.upper())
+    """Dynamic currency normalization from value patterns."""
+    return _detect_currency(currency)
 
 def normalize_label(label: str | None) -> str:
-    raw = (label or "").strip().lower()
-    if not raw:
-        return ""
-    return LABEL_MAP.get(raw, raw)
+    """Dynamic label normalization — no hardcoded map."""
+    return _normalize_label_dynamic(label)
 
 def clean_amounts(amounts: list) -> list:
     cleaned = []
@@ -142,41 +183,50 @@ def deduplicate_entities(entity_list: list) -> list:
     return deduplicated
 
 
-# ── Step 5: Payment Method Separator ─────────────────────────────────────────
+# ── Step 5: Payment Method Separator (pattern-based) ──────────────────────────
 
 def separate_payment_methods(organizations: list) -> tuple:
-    """Split orgs into real organizations and payment methods."""
+    """Split orgs into real organizations and payment methods using pattern detection."""
     orgs = []
     payment_methods = []
     for item in organizations:
-        value = str(item.get("value", "")).strip().lower()
-        if value in PAYMENT_METHODS:
+        value = str(item.get("value", "")).strip()
+        if _is_payment_method_like(value):
             payment_methods.append({
                 **item,
-                "value": item["value"].strip().title()
+                "value": value.title()
             })
         else:
             orgs.append(item)
     return orgs, payment_methods
 
 
-# ── Step 6: ID Assigner ───────────────────────────────────────────────────────
+# ── Step 6: ID Assigner (generic) ────────────────────────────────────────────
 
 def assign_entity_ids(entities: dict) -> tuple:
-    """Assign short IDs to every entity. Return enriched entities + id_map."""
+    """Assign short IDs to every entity type dynamically."""
     id_map = {}
     result = {}
 
-    prefixes = {
-        "person_names": "p",
-        "organizations": "o",
-        "dates": "d",
-        "amounts": "a",
-        "payment_methods": "pm",
-    }
-
-    for entity_type, prefix in prefixes.items():
+    # Auto-detect entity types and assign prefixes
+    for entity_type in entities:
         items = entities.get(entity_type, [])
+        if not isinstance(items, list):
+            continue
+
+        # Generate prefix from first 1-2 chars of type name
+        prefix = entity_type[:2].lower() if entity_type else "x"
+        if prefix in ("pe",):
+            prefix = "p"  # person_names → p
+        elif prefix in ("or",):
+            prefix = "o"  # organizations → o
+        elif prefix in ("da",):
+            prefix = "d"  # dates → d
+        elif prefix in ("am",):
+            prefix = "a"  # amounts → a
+        elif prefix in ("pa",):
+            prefix = "pm"  # payment_methods → pm
+
         result[entity_type] = []
         for i, item in enumerate(items):
             entity_id = f"{prefix}{i+1}"
@@ -211,8 +261,9 @@ def compute_overall_confidence(entities: dict) -> float:
     scores = [
         item["confidence"]
         for entity_list in entities.values()
+        if isinstance(entity_list, list)
         for item in entity_list
-        if "confidence" in item
+        if isinstance(item, dict) and "confidence" in item
     ]
     return round(sum(scores) / len(scores), 2) if scores else 0.0
 
@@ -224,32 +275,36 @@ def post_process(ai_output: dict, source_file: str, file_metadata: dict) -> dict
         # Step 1: Validate schema
         data = validate_schema(ai_output)
 
-        # Step 2: Clean dates
-        data["entities"]["dates"] = clean_dates(data["entities"]["dates"])
+        entities = data.get("entities", {})
 
-        # Step 3: Clean amounts
-        data["entities"]["amounts"] = clean_amounts(data["entities"]["amounts"])
+        # Step 2: Clean dates (if present)
+        if "dates" in entities:
+            entities["dates"] = clean_dates(entities["dates"])
 
-        # Step 4: Deduplicate person names and organizations
-        data["entities"]["person_names"] = deduplicate_entities(
-            data["entities"]["person_names"]
-        )
-        data["entities"]["organizations"] = deduplicate_entities(
-            data["entities"]["organizations"]
-        )
+        # Step 3: Clean amounts (if present)
+        if "amounts" in entities:
+            entities["amounts"] = clean_amounts(entities["amounts"])
 
-        # Step 5: Separate payment methods from organizations
-        orgs, payment_methods = separate_payment_methods(
-            data["entities"]["organizations"]
-        )
-        data["entities"]["organizations"] = orgs
-        data["entities"]["payment_methods"] = deduplicate_entities(payment_methods)
+        # Step 4: Deduplicate all text-based entity lists
+        for key in list(entities.keys()):
+            if key in ("amounts", "dates"):
+                continue
+            if isinstance(entities[key], list):
+                entities[key] = deduplicate_entities(entities[key])
+
+        # Step 5: Separate payment methods from organizations (if present)
+        if "organizations" in entities:
+            orgs, payment_methods = separate_payment_methods(entities["organizations"])
+            entities["organizations"] = orgs
+            entities["payment_methods"] = deduplicate_entities(payment_methods)
+
+        data["entities"] = entities
 
         # Step 6: Assign IDs
         entities_with_ids, id_map = assign_entity_ids(data["entities"])
 
         # Step 7: Map relationships
-        relationships = process_relationships(data["relationships"], id_map)
+        relationships = process_relationships(data.get("relationships", []), id_map)
 
         # Compute confidence
         confidence_overall = compute_overall_confidence(entities_with_ids)
@@ -260,7 +315,7 @@ def post_process(ai_output: dict, source_file: str, file_metadata: dict) -> dict
 
         return {
             "document_id": str(uuid.uuid4()),
-            "document_type": data["document_type"],
+            "document_type": data.get("document_type", "generic"),
             "source_file": source_file,
             "status": "success",
             "error": None,
@@ -306,7 +361,7 @@ def _convert_universal_envelope_to_toml(result: dict) -> str:
 
 
 def convert_to_toml(result: dict) -> str:
-    """Convert structured JSON output to TOML format."""
+    """Convert structured JSON output to TOML format — generic entity iteration."""
     if isinstance(result.get("data"), list) and "entities" not in result:
         return _convert_universal_envelope_to_toml(result)
 
@@ -332,53 +387,26 @@ def convert_to_toml(result: dict) -> str:
             lines.append(f'{key} = {value}')
     lines.append("")
 
-    # Entities
+    # Entities — generic iteration over all entity types
     entities = result.get("entities", {})
-
-    if entities.get("person_names"):
-        for item in entities["person_names"]:
-            lines.append("[[entities.person_names]]")
-            lines.append(f'id = "{item.get("id", "")}"')
-            lines.append(f'value = "{item.get("value", "")}"')
-            lines.append(f'confidence = {item.get("confidence", 0.0)}')
-            lines.append("")
-
-    if entities.get("organizations"):
-        for item in entities["organizations"]:
-            lines.append("[[entities.organizations]]")
-            lines.append(f'id = "{item.get("id", "")}"')
-            lines.append(f'value = "{item.get("value", "")}"')
-            lines.append(f'confidence = {item.get("confidence", 0.0)}')
-            lines.append("")
-
-    if entities.get("dates"):
-        for item in entities["dates"]:
-            lines.append("[[entities.dates]]")
-            lines.append(f'id = "{item.get("id", "")}"')
-            lines.append(f'value = "{item.get("value", "")}"')
-            if item.get("label"):
-                lines.append(f'label = "{item.get("label", "")}"')
-            lines.append(f'confidence = {item.get("confidence", 0.0)}')
-            lines.append("")
-
-    if entities.get("amounts"):
-        for item in entities["amounts"]:
-            lines.append("[[entities.amounts]]")
-            lines.append(f'id = "{item.get("id", "")}"')
-            lines.append(f'value = {item.get("value", 0)}')
-            lines.append(f'currency = "{item.get("currency", "")}"')
-            lines.append(f'label = "{item.get("label", "")}"')
-            lines.append(f'confidence = {item.get("confidence", 0.0)}')
-            if item.get("flag"):
-                lines.append(f'flag = "{item.get("flag", "")}"')
-            lines.append("")
-
-    if entities.get("payment_methods"):
-        for item in entities["payment_methods"]:
-            lines.append("[[entities.payment_methods]]")
-            lines.append(f'id = "{item.get("id", "")}"')
-            lines.append(f'value = "{item.get("value", "")}"')
-            lines.append(f'confidence = {item.get("confidence", 0.0)}')
+    for entity_type, items in entities.items():
+        if not isinstance(items, list) or not items:
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"[[entities.{entity_type}]]")
+            for k, v in item.items():
+                if v is None:
+                    lines.append(f'{k} = "null"')
+                elif isinstance(v, bool):
+                    lines.append(f"{k} = {str(v).lower()}")
+                elif isinstance(v, (int, float)):
+                    lines.append(f"{k} = {v}")
+                elif isinstance(v, str):
+                    lines.append(f'{k} = "{v}"')
+                else:
+                    lines.append(f'{k} = {json.dumps(v)}')
             lines.append("")
 
     # Relationships

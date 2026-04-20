@@ -1,13 +1,15 @@
 """
-Final cleaning layer — dataset-agnostic, conservative ETL-style repair.
+Context-Aware Final Cleaning Layer — schema-agnostic, non-destructive, data-driven.
 
-Policy is driven by :class:`CleaningConfig` (environment variables), including
-clean mode (``safe`` / ``strict``), email handling (``none`` / ``remove_row`` / ``placeholder``),
-optional text sentinels, median imputation thresholds, and optional ``__imputed__`` lineage.
-Never bulk-fills phone-like, ID-like, or near-unique identifier columns.
+Paradigm: Observe → Infer → Decide → Clean
 
-Imputation lineage records the *method* used (``median``, ``placeholder``,
-``text_placeholder``) so every filled value is explainable.
+All decisions derived from DatasetProfile. NO hardcoded column names.
+Cleaning strategy adapts to inferred dataset type:
+  - Entity: normalize text, validate structured fields, allow safe imputation
+  - Transactional: preserve numeric, normalize formats, deduplicate
+  - Analytical: NO modification of numeric values, NO imputation, clean noise only
+
+Policy driven by :class:`CleaningConfig` (environment variables).
 """
 
 from __future__ import annotations
@@ -32,58 +34,41 @@ from core.cleaning import (
     normalize_date_value,
     normalize_status_value,
 )
-from core.schema_cleanup import infer_critical_fields, validate_row_numeric_aggregate
+from core.data_profiler import (
+    ColumnProfile,
+    DatasetProfile,
+    _INTERNAL_KEYS,
+    _PIPELINE_ARTIFACT_KEYS,
+    _RESERVED_KEYS,
+    _coerce_bool,
+    _coerce_number,
+    _is_present,
+    clean_text_noise,
+    compute_median,
+    compute_mode,
+    detect_field_types,
+    detect_numeric_outliers,
+    profile_dataset,
+)
 from parsers.csv_parser import normalize_field_name
 
 logger = logging.getLogger(__name__)
 
-_EMAIL_LIKE_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
-
-_RESERVED_KEYS = frozenset(
-    {
-        "confidence",
-        "is_anomaly",
-        "is_valid_email",
-        "is_valid_date",
-        "is_valid_numeric",
-        "is_outlier",
-    }
-)
-
-# Internal / lineage keys — never imputed, excluded from missing-rate denominators.
-_INTERNAL_KEYS = frozenset({"__imputed__"})
-_PIPELINE_ARTIFACT_KEYS = frozenset(
-    {
-        "__imputed__",
-        "imputed",
-        "confidence",
-        "is_anomaly",
-        "is_outlier",
-        "is_valid_email",
-        "is_valid_date",
-        "is_valid_numeric",
-    }
-)
-
-# Keys used only for QC / scoring — excluded from "missing rate" so rows are not
-# penalized for synthetic boolean fields.
+# Keys excluded from missing-rate denominators
 _RATIO_EXCLUDED_KEYS = _RESERVED_KEYS | frozenset({"is_outlier"}) | _INTERNAL_KEYS
 
 
 @dataclass(frozen=True)
 class CleaningConfig:
     """
-    Env-driven cleaning policy (no dataset-specific table names).
+    Env-driven cleaning policy (no dataset-specific logic).
 
-    * ``AITL_CLEAN_MODE``: ``safe`` (default) | ``strict`` — strict uses a lower
-      missing-value threshold for row drops.
+    * ``AITL_CLEAN_MODE``: ``safe`` (default) | ``strict``
     * ``AITL_EMAIL_INVALID_STRATEGY``: ``none`` (default) | ``remove_row`` | ``placeholder``
     * ``AITL_EMAIL_PLACEHOLDER``: placeholder address when strategy is ``placeholder``
-    * ``AITL_TEXT_MISSING_PLACEHOLDER``: if non-empty, fill **only** missing *text* cells
-      (never phones / high-cardinality identifiers).
-    * ``AITL_TRACK_IMPUTATION``: ``1`` (default) | ``0`` — add per-row ``__imputed__`` map.
-    * ``AITL_MIN_VALUES_FOR_MEDIAN``: minimum count of observed numeric values required
-      before median imputation is allowed (default ``3``).
+    * ``AITL_TEXT_MISSING_PLACEHOLDER``: fill only missing text cells (never IDs/phones)
+    * ``AITL_TRACK_IMPUTATION``: ``1`` (default) | ``0``
+    * ``AITL_MIN_VALUES_FOR_MEDIAN``: min observed values for median imputation (default ``3``)
     """
 
     clean_mode: str
@@ -107,10 +92,7 @@ class CleaningConfig:
         txt_ph = (os.getenv("AITL_TEXT_MISSING_PLACEHOLDER") or "").strip()
         txt_out: str | None = txt_ph if txt_ph else None
         track = os.getenv("AITL_TRACK_IMPUTATION", "1").strip().lower() not in (
-            "0",
-            "false",
-            "no",
-            "off",
+            "0", "false", "no", "off",
         )
         try:
             min_med = int(os.getenv("AITL_MIN_VALUES_FOR_MEDIAN", "3"))
@@ -127,11 +109,12 @@ class CleaningConfig:
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Schema Enforcement
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def enforce_schema(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Collect every key seen across the dataset and ensure each record contains all keys.
-    Missing entries are set to None.
-    """
+    """Ensure every record contains all keys seen across the dataset."""
     all_keys: list[str] = []
     seen: set[str] = set()
     for r in records:
@@ -149,221 +132,9 @@ def enforce_schema(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def _is_present(v: Any) -> bool:
-    if v is None:
-        return False
-    if isinstance(v, str) and not v.strip():
-        return False
-    return True
-
-
-def _is_name_like_key(key: str) -> bool:
-    nk = normalize_field_name(key)
-    if not nk:
-        return False
-    if "company" in nk or "org" in nk or "organization" in nk:
-        return False
-    return "name" in nk or nk in ("person", "customer", "employee", "full_name")
-
-
-def _is_city_like_key(key: str) -> bool:
-    nk = normalize_field_name(key)
-    return any(x in nk for x in ("city", "town", "municipality", "location", "address"))
-
-
-def _is_status_like_key(key: str) -> bool:
-    nk = normalize_field_name(key)
-    return "status" in nk or nk in ("state", "stage")
-
-
-_UNITS: dict[str, int] = {
-    "zero": 0,
-    "one": 1,
-    "two": 2,
-    "three": 3,
-    "four": 4,
-    "five": 5,
-    "six": 6,
-    "seven": 7,
-    "eight": 8,
-    "nine": 9,
-    "ten": 10,
-    "eleven": 11,
-    "twelve": 12,
-    "thirteen": 13,
-    "fourteen": 14,
-    "fifteen": 15,
-    "sixteen": 16,
-    "seventeen": 17,
-    "eighteen": 18,
-    "nineteen": 19,
-}
-
-_TENS: dict[str, int] = {
-    "twenty": 20,
-    "thirty": 30,
-    "forty": 40,
-    "fifty": 50,
-    "sixty": 60,
-    "seventy": 70,
-    "eighty": 80,
-    "ninety": 90,
-}
-
-
-def _parse_english_number_words(low: str) -> int | None:
-    """
-    Parse common English number phrases (dataset-agnostic wording, not column names).
-    Examples: "twenty five" → 25, "one hundred" → 100, "twenty-five" → 25.
-    """
-    s = re.sub(r"[\s,]+", " ", low.lower().strip().replace("-", " "))
-    if not s:
-        return None
-    words = [w for w in s.split() if w]
-    if not words:
-        return None
-    if any(c.isdigit() for c in s):
-        return None
-
-    def consume_units(idx: int) -> tuple[int | None, int]:
-        if idx >= len(words):
-            return None, idx
-        w = words[idx]
-        if w in _UNITS:
-            return _UNITS[w], idx + 1
-        return None, idx
-
-    def consume_tens_units(idx: int) -> tuple[int | None, int]:
-        if idx >= len(words):
-            return None, idx
-        w = words[idx]
-        if w in _TENS:
-            total = _TENS[w]
-            idx += 1
-            u, idx2 = consume_units(idx)
-            if u is not None and u < 10:
-                return total + u, idx2
-            return total, idx
-        return consume_units(idx)
-
-    # "one hundred [and] twenty five" style
-    if "hundred" in words:
-        hi = words.index("hundred")
-        if hi == 0:
-            return None
-        if words[hi - 1] not in _UNITS:
-            return None
-        hundreds = _UNITS[words[hi - 1]]
-        if hundreds == 0:
-            return None
-        rest_start = hi + 1
-        if rest_start < len(words) and words[rest_start] == "and":
-            rest_start += 1
-        if rest_start >= len(words):
-            return hundreds * 100
-        sub = " ".join(words[rest_start:])
-        sub_val = _parse_english_number_words(sub)
-        if sub_val is None:
-            return None
-        return hundreds * 100 + sub_val
-
-    total, idx = consume_tens_units(0)
-    if total is None:
-        return None
-    if idx < len(words):
-        return None
-    return total
-
-
-def _coerce_number(value: Any) -> float | int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        if value != value:  # NaN
-            return None
-        if isinstance(value, float) and value == int(value) and abs(value) < 1e12:
-            return int(value)
-        return float(value)
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return None
-        low = s.lower()
-        wn = _parse_english_number_words(low)
-        if wn is not None:
-            return wn
-        n = amount_from_value(s)
-        if n is not None:
-            if n == int(n) and abs(n) < 1e12:
-                return int(n)
-            return float(n)
-    return None
-
-
-def _looks_like_email_string(s: str) -> bool:
-    return bool(_EMAIL_LIKE_RE.match(s.strip()))
-
-
-def _coerce_bool(value: Any) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if value == 1:
-            return True
-        if value == 0:
-            return False
-        return None
-    if isinstance(value, str):
-        v = value.strip().lower()
-        if v in {"true", "t", "yes", "y", "1"}:
-            return True
-        if v in {"false", "f", "no", "n", "0"}:
-            return False
-    return None
-
-
-def _detect_boolean_columns(records: list[dict[str, Any]], keys: Iterable[str]) -> set[str]:
-    out: set[str] = set()
-    for k in keys:
-        nk = normalize_field_name(k)
-        vals = [r.get(k) for r in records if _is_present(r.get(k))]
-        if not vals:
-            continue
-        bool_hits = sum(1 for v in vals if _coerce_bool(v) is not None)
-        ratio = bool_hits / len(vals)
-        name_hint = (
-            nk.startswith("is_")
-            or nk.startswith("has_")
-            or "flag" in nk
-            or "enabled" in nk
-            or "active" in nk
-            or "applied" in nk
-        )
-        if ratio >= 0.8 or (name_hint and ratio >= 0.5):
-            out.add(k)
-    return out
-
-
-def _safe_default_for_field(
-    key: str,
-    *,
-    numeric_cols: set[str],
-    date_cols: set[str],
-    text_cols: set[str],
-    bool_cols: set[str],
-) -> Any:
-    if key in bool_cols:
-        return False
-    if key in numeric_cols:
-        return 0
-    if key in date_cols:
-        return "unknown"
-    if key in text_cols:
-        return "unknown"
-    return "unknown"
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _strip_pipeline_artifacts(row: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -371,293 +142,6 @@ def _strip_pipeline_artifacts(row: dict[str, Any]) -> dict[str, Any]:
         for k, v in row.items()
         if k not in _PIPELINE_ARTIFACT_KEYS and not str(k).startswith("__")
     }
-
-
-def detect_field_types(records: list[dict[str, Any]]) -> dict[str, set[str]]:
-    """
-    Classify columns from **value patterns** (digits, ``@``, parseability), not dataset names.
-
-    Returns ``{"numeric": set(...), "email": set(...), "date": set(...), "text": set(...)}``.
-    Each non-reserved key appears in exactly one bucket.
-    """
-    out: dict[str, set[str]] = {"numeric": set(), "email": set(), "date": set(), "text": set()}
-    if not records:
-        return out
-
-    keys = [
-        k
-        for k in records[0].keys()
-        if k not in _RESERVED_KEYS
-        and k not in _INTERNAL_KEYS
-        and not str(k).startswith("__")
-    ]
-    n = len(records)
-
-    for k in keys:
-        filled = 0
-        str_vals: list[str] = []
-        at_like = 0
-        valid_email_n = 0
-        num_ok = 0
-        date_ok = 0
-
-        for r in records:
-            v = r.get(k)
-            if not _is_present(v):
-                continue
-            filled += 1
-            if isinstance(v, str):
-                sv = v.strip()
-                str_vals.append(sv)
-                if _looks_like_email_string(sv):
-                    at_like += 1
-                if is_valid_email(sv):
-                    valid_email_n += 1
-                # Check if the string parses as a date
-                if is_valid_date(sv):
-                    date_ok += 1
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                num_ok += 1
-            elif isinstance(v, str):
-                sv = v.strip()
-                if "@" in sv:
-                    continue
-                if _coerce_number(sv) is not None:
-                    num_ok += 1
-
-        if filled == 0:
-            out["text"].add(k)
-            continue
-
-        email_ratio = at_like / filled
-        valid_email_ratio = valid_email_n / filled
-        num_ratio = num_ok / filled
-        date_ratio = date_ok / filled
-
-        # Email: many cells look like addresses (``@`` + TLD) or mostly valid emails
-        if email_ratio >= 0.35 or valid_email_ratio >= 0.25:
-            out["email"].add(k)
-            continue
-
-        # Date: ≥40% of filled values parse as dates AND the column key hints at temporal
-        # data OR ≥60% parse as dates regardless of name. Never classify a mostly-numeric
-        # column as date (pure integers like 2024 can parse as dates).
-        nk = normalize_field_name(k)
-        date_name_hint = any(
-            x in nk for x in ("date", "dob", "birth", "timestamp", "created", "updated", "joined", "hired")
-        )
-        if num_ratio < 0.5 and (
-            (date_ratio >= 0.40 and date_name_hint) or date_ratio >= 0.60
-        ):
-            out["date"].add(k)
-            continue
-
-        # Single-row inputs: infer from the present cell(s) using the same signals.
-        if n == 1:
-            if num_ratio >= 1.0 or (filled == 1 and num_ok == 1):
-                out["numeric"].add(k)
-            else:
-                out["text"].add(k)
-            continue
-
-        if filled < max(2, min(3, n // 2 or 1)):
-            out["text"].add(k)
-            continue
-
-        if num_ratio >= 0.55:
-            out["numeric"].add(k)
-        else:
-            out["text"].add(k)
-
-    return out
-
-
-def _detect_phone_like_columns(records: list[dict[str, Any]], keys: Iterable[str]) -> set[str]:
-    """Columns whose values look like phone numbers — never bulk-imputed or text-filled."""
-    out: set[str] = set()
-    for k in keys:
-        filled: list[str] = []
-        for r in records:
-            v = r.get(k)
-            if not _is_present(v):
-                continue
-            filled.append(str(v).strip())
-        if not filled:
-            continue
-        hit = 0
-        for v in filled:
-            if is_valid_phone(v):
-                hit += 1
-                continue
-            digits = re.sub(r"\D+", "", v)
-            if 10 <= len(digits) <= 15 and len(digits) >= len(v) * 0.45:
-                hit += 1
-        if hit / len(filled) >= 0.5:
-            out.add(k)
-    return out
-
-
-def _detect_id_like_text_columns(
-    records: list[dict[str, Any]], text_keys: Iterable[str]
-) -> set[str]:
-    """
-    Text columns that are identifier-like (UUID, serial, reference, code) or
-    near-unique — never filled with text placeholders. Detection is purely
-    pattern-based (column name heuristics + cardinality), no dataset-specific rules.
-    """
-    _ID_FRAGMENTS = (
-        "id", "uuid", "ref", "reference", "key", "code", "serial",
-        "number", "num", "no", "identifier", "index", "idx", "ticket",
-        "order", "account", "invoice", "sku", "barcode", "ssn", "passport",
-    )
-    # Not "phone_number" — those are handled by _detect_phone_like_columns.
-    _EXCLUDE_FRAGMENTS = ("phone", "tel", "mobile", "cell", "fax")
-    out: set[str] = set()
-    for k in text_keys:
-        nk = normalize_field_name(k)
-        if not nk:
-            continue
-        # Skip phone-like column names
-        if any(x in nk for x in _EXCLUDE_FRAGMENTS):
-            continue
-        # Name-based: key contains an ID-like fragment
-        name_hit = any(x in nk for x in _ID_FRAGMENTS)
-        # Cardinality-based: ≥90% unique values when enough data
-        filled_vals: list[str] = []
-        for r in records:
-            v = r.get(k)
-            if _is_present(v):
-                filled_vals.append(str(v).strip().lower())
-        if not filled_vals:
-            continue
-        distinct_ratio = len(set(filled_vals)) / len(filled_vals) if filled_vals else 0
-        high_cardinality = len(filled_vals) >= 5 and distinct_ratio >= 0.90
-        if name_hit or high_cardinality:
-            out.add(k)
-    return out
-
-
-def _should_skip_numeric_bulk_impute(records: list[dict[str, Any]], k: str) -> bool:
-    """
-    Identifier-like / near-unique numeric columns: do not fabricate repeated values.
-    """
-    vals: list[float] = []
-    for r in records:
-        v = r.get(k)
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            vals.append(float(v))
-    n = len(vals)
-    if n < 2:
-        return True
-    distinct = len({round(v, 6) for v in vals})
-    if n <= 24 and distinct >= n - 1:
-        return True
-    if n >= 5 and distinct / n >= 0.92:
-        return True
-    return False
-
-
-def _schema_key_order(all_keys: Iterable[str], *, include_imputed_slot: bool) -> list[str]:
-    keys = list(all_keys)
-    content = sorted(
-        k
-        for k in keys
-        if k not in _RESERVED_KEYS and k not in _INTERNAL_KEYS and not str(k).startswith("__")
-    )
-    reserved = sorted(k for k in keys if k in _RESERVED_KEYS)
-    other = sorted(
-        k
-        for k in keys
-        if k not in content and k not in reserved and k not in _INTERNAL_KEYS
-    )
-    out = content + reserved + other
-    if include_imputed_slot and "__imputed__" not in out:
-        out.append("__imputed__")
-    return out
-
-
-def _reorder_record_keys(row: dict[str, Any], key_order: list[str]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for k in key_order:
-        if k in row:
-            out[k] = row[k]
-    for k, v in row.items():
-        if k not in out:
-            out[k] = v
-    return out
-
-
-def _median(vals: list[float]) -> float | None:
-    if not vals:
-        return None
-    s = sorted(vals)
-    m = len(s) // 2
-    if len(s) % 2:
-        return float(s[m])
-    return float(s[m - 1] + s[m]) / 2.0
-
-
-def _normalize_strings_inplace(record: dict[str, Any]) -> None:
-    for k, v in list(record.items()):
-        if k in _RESERVED_KEYS:
-            continue
-        if isinstance(v, str):
-            s = v.strip()
-            if not s:
-                record[k] = None
-                continue
-            nk = normalize_field_name(k)
-            if _is_city_like_key(k):
-                record[k] = normalize_city(s)
-            elif _is_name_like_key(k):
-                record[k] = clean_name(s)
-            elif _is_status_like_key(k):
-                record[k] = normalize_status_value(s)
-            elif "date" in nk or nk in ("dob", "birth", "timestamp", "created", "updated"):
-                iso = normalize_date_value(s)
-                record[k] = iso if iso else (s[:128] if s else None)
-            else:
-                record[k] = s
-
-
-def _refresh_validation_flags(
-    record: dict[str, Any],
-    email_cols: set[str] | None = None,
-    date_cols: set[str] | None = None,
-) -> None:
-    """Recompute validation booleans using dynamically detected column sets."""
-    # Email validation — check ALL detected email columns, not just "email"
-    e_cols = email_cols or set()
-    if e_cols:
-        any_email_valid = False
-        any_email_present = False
-        for ek in e_cols:
-            em = record.get(ek)
-            if em and str(em).strip():
-                any_email_present = True
-                if is_valid_email(str(em)):
-                    any_email_valid = True
-        record["is_valid_email"] = any_email_valid if any_email_present else True
-    else:
-        record.pop("is_valid_email", None)
-
-    # Date validation — check ALL detected date columns, not just "date"
-    d_cols = date_cols or {"date"}
-    any_date_invalid = False
-    any_date_present = False
-    for dk in d_cols:
-        dt = record.get(dk)
-        if dt is not None and str(dt).strip():
-            any_date_present = True
-            if not is_valid_date(dt):
-                any_date_invalid = True
-    record["is_valid_date"] = not any_date_invalid if any_date_present else True
-
-    if validate_row_numeric_aggregate(record):
-        record["is_valid_numeric"] = True
-    else:
-        # Keep false only when a field looked numeric-like but parsing failed.
-        record["is_valid_numeric"] = False
 
 
 def _missing_ratio(record: dict[str, Any], schema_keys: list[str]) -> float:
@@ -669,7 +153,7 @@ def _missing_ratio(record: dict[str, Any], schema_keys: list[str]) -> float:
 
 
 def _compute_null_rate(records: list[dict[str, Any]], schema_keys: list[str]) -> float:
-    """Fraction of ``None``/empty cells across the entire dataset (excluding reserved keys)."""
+    """Fraction of None/empty cells across entire dataset (excluding reserved keys)."""
     denom_keys = [k for k in schema_keys if k not in _RATIO_EXCLUDED_KEYS]
     if not denom_keys or not records:
         return 0.0
@@ -695,15 +179,203 @@ def _dedupe_identical_rows(records: list[dict[str, Any]]) -> tuple[list[dict[str
     return out, len(records) - len(out)
 
 
+def _dedupe_by_keys(
+    records: list[dict[str, Any]],
+    dedup_keys: list[str],
+) -> tuple[list[dict[str, Any]], int]:
+    """Deduplicate using value-based fingerprinting on the given keys."""
+    if not dedup_keys:
+        return _dedupe_identical_rows(records)
+    seen_map: dict[tuple, dict[str, Any]] = {}
+    for r in records:
+        sig = tuple(str(r.get(k, "")).strip().lower() for k in dedup_keys)
+        conf = float(r.get("confidence", 0.0))
+        if sig not in seen_map or conf > float(seen_map[sig].get("confidence", 0.0)):
+            seen_map[sig] = r
+    deduped = list(seen_map.values())
+    return deduped, len(records) - len(deduped)
+
+
+def _safe_default_for_type(inferred_type: str) -> Any:
+    """Return a safe default value based on inferred column type."""
+    if inferred_type in ("boolean",):
+        return False
+    if inferred_type in ("numeric", "monetary"):
+        return 0
+    if inferred_type in ("phone", "email", "identifier"):
+        return ""  # Do NOT fill structured types with 'unknown'
+    if inferred_type in ("date",):
+        return "unknown"
+    return "unknown"
+
+
+def _schema_key_order(all_keys: Iterable[str], *, include_imputed_slot: bool) -> list[str]:
+    keys = list(all_keys)
+    content = sorted(
+        k for k in keys
+        if k not in _RESERVED_KEYS and k not in _INTERNAL_KEYS and not str(k).startswith("__")
+    )
+    reserved = sorted(k for k in keys if k in _RESERVED_KEYS)
+    other = sorted(
+        k for k in keys
+        if k not in content and k not in reserved and k not in _INTERNAL_KEYS
+    )
+    out = content + reserved + other
+    if include_imputed_slot and "__imputed__" not in out:
+        out.append("__imputed__")
+    return out
+
+
+def _reorder_record_keys(row: dict[str, Any], key_order: list[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k in key_order:
+        if k in row:
+            out[k] = row[k]
+    for k, v in row.items():
+        if k not in out:
+            out[k] = v
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Context-aware normalization (uses DatasetProfile types, not column names)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _normalize_value_by_type(
+    value: Any,
+    col_profile: ColumnProfile,
+    dataset_type: str,
+) -> Any:
+    """
+    Normalize a value based on its inferred TYPE, not its column name.
+
+    For analytical datasets: only clean noise, NEVER modify numeric values.
+    """
+    if not _is_present(value):
+        return None
+
+    ct = col_profile.inferred_type
+
+    # Analytical data: preserve all values, only clean string noise
+    if dataset_type == "analytical":
+        if isinstance(value, str):
+            return clean_text_noise(value.strip())
+        return value
+
+    # Email: validate format
+    if ct == "email":
+        s = str(value).strip().lower()
+        if is_valid_email(s):
+            return s
+        return None  # null invalid emails
+
+    # Phone: normalize to digits
+    if ct == "phone":
+        s = str(value).strip()
+        digits = re.sub(r"\D+", "", s)
+        if 10 <= len(digits) <= 15:
+            return digits
+        return None
+
+    # Date: parse to ISO or null
+    if ct == "date":
+        iso = normalize_date_value(value)
+        if iso:
+            return iso
+        return None
+
+    # Numeric / monetary: coerce to number
+    if ct in ("numeric", "monetary"):
+        # For transactional data: preserve original, only coerce format
+        n = _coerce_number(value)
+        if n is not None:
+            if n == int(n) and abs(n) < 1e12:
+                return int(n)
+            return float(n)
+        return None
+
+    # Boolean
+    if ct == "boolean":
+        b = _coerce_bool(value)
+        if b is not None:
+            return b
+        return value
+
+    # Text / categorical / identifier: normalize string
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        # Clean noise
+        s = clean_text_noise(s)
+        # Normalize whitespace
+        s = re.sub(r"\s+", " ", s)
+        # Title case for text/categorical (not identifiers, not URLs)
+        if ct in ("text", "categorical") and "@" not in s and "://" not in s:
+            s = s.title()
+        return s
+
+    return value
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Validation flags (dynamic, profile-driven)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _refresh_validation_flags(
+    record: dict[str, Any],
+    email_cols: set[str] | None = None,
+    date_cols: set[str] | None = None,
+) -> None:
+    """Recompute validation booleans using dynamically detected column sets."""
+    e_cols = email_cols or set()
+    if e_cols:
+        any_email_valid = False
+        any_email_present = False
+        for ek in e_cols:
+            em = record.get(ek)
+            if em and str(em).strip():
+                any_email_present = True
+                if is_valid_email(str(em)):
+                    any_email_valid = True
+        record["is_valid_email"] = any_email_valid if any_email_present else True
+    else:
+        record.pop("is_valid_email", None)
+
+    d_cols = date_cols or set()
+    if d_cols:
+        any_date_invalid = False
+        any_date_present = False
+        for dk in d_cols:
+            dt = record.get(dk)
+            if dt is not None and str(dt).strip():
+                any_date_present = True
+                if not is_valid_date(dt):
+                    any_date_invalid = True
+        record["is_valid_date"] = not any_date_invalid if any_date_present else True
+    else:
+        record["is_valid_date"] = True
+
+    record["is_valid_numeric"] = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY: run_final_cleaning_layer
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def run_final_cleaning_layer(
     records: list[dict[str, Any]],
     *,
     config: CleaningConfig | None = None,
+    **kwargs: Any,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
-    Production pass on a **copy** of rows: conservative imputation, optional email policy,
-    no synthetic IDs/phones, optional ``__imputed__`` lineage with method tags.
-    ``config`` defaults to :meth:`CleaningConfig.from_env`.
+    Context-aware cleaning pass on a **copy** of rows.
+
+    Cleaning strategy driven by DatasetProfile:
+      - Entity: normalize text, validate structured, safe imputation
+      - Transactional: preserve numeric, normalize formats, deduplicate
+      - Analytical: NO modification, NO imputation, noise removal only
     """
     cfg = config or CleaningConfig.from_env()
     rows_in = len(records)
@@ -730,96 +402,107 @@ def run_final_cleaning_layer(
     if not records:
         return [], stats
 
-    logger.info("Final cleaning started")
+    logger.info("Final cleaning started | mode=%s", cfg.clean_mode)
 
+    # Deep copy to avoid mutating originals
     working = copy.deepcopy(records)
     for r in working:
         r.pop("__imputed__", None)
 
+    # Enforce consistent schema
     working = enforce_schema(working)
-    logger.info("Schema enforced")
-
     schema_keys = list(working[0].keys())
 
     # ── Measure null rate BEFORE cleaning ──
     null_rate_before = _compute_null_rate(working, schema_keys)
 
-    field_types = detect_field_types(working)
+    # ── Profile the dataset (the brain) ──
+    profile = profile_dataset(working)
+    dataset_type = profile.dataset_type
+    logger.info("Dataset type detected: %s", dataset_type)
+
+    # Build type sets for stats and backward compat
+    email_cols: set[str] = set()
+    date_cols: set[str] = set()
+    numeric_cols: set[str] = set()
+    text_cols: set[str] = set()
+    phone_cols: set[str] = set()
+    id_like_cols: set[str] = set()
+    boolean_cols: set[str] = set()
+    no_impute_cols: set[str] = set()
+
+    for name, cp in profile.columns.items():
+        if cp.inferred_type == "email":
+            email_cols.add(name)
+        elif cp.inferred_type == "date":
+            date_cols.add(name)
+        elif cp.inferred_type in ("numeric", "monetary"):
+            numeric_cols.add(name)
+        elif cp.inferred_type == "phone":
+            phone_cols.add(name)
+        elif cp.inferred_type == "boolean":
+            boolean_cols.add(name)
+        elif cp.inferred_type == "identifier":
+            id_like_cols.add(name)
+        else:
+            text_cols.add(name)
+
+        if not cp.allows_imputation:
+            no_impute_cols.add(name)
+
     stats["field_types"] = {
-        "numeric": sorted(field_types["numeric"]),
-        "email": sorted(field_types["email"]),
-        "date": sorted(field_types.get("date", set())),
-        "text": sorted(field_types["text"]),
+        "numeric": sorted(numeric_cols),
+        "email": sorted(email_cols),
+        "date": sorted(date_cols),
+        "text": sorted(text_cols),
+        "phone": sorted(phone_cols),
+        "identifier": sorted(id_like_cols),
+        "boolean": sorted(boolean_cols),
     }
-    numeric_cols = set(field_types["numeric"])
-    email_cols = set(field_types["email"])
-    date_cols = set(field_types.get("date", set()))
-    text_cols = set(field_types["text"])
+    stats["dataset_type"] = dataset_type
 
     content_keys = [
-        k
-        for k in schema_keys
+        k for k in schema_keys
         if k not in _RESERVED_KEYS and k not in _INTERNAL_KEYS and not str(k).startswith("__")
     ]
-    phone_like = _detect_phone_like_columns(working, content_keys)
-    id_like_text = _detect_id_like_text_columns(working, text_cols)
-
-    # Digit-heavy strings (phones) must not be classified or coerced as plain numbers.
-    for k in phone_like & numeric_cols:
-        numeric_cols.remove(k)
-        text_cols.add(k)
-    # Date columns must not be coerced as numbers
-    for k in date_cols & numeric_cols:
-        numeric_cols.remove(k)
 
     invalid_fixed_cells = 0
     invalid_changed = False
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PASS 1: Type-aware normalization (driven by DatasetProfile, not names)
+    # ═══════════════════════════════════════════════════════════════════════════
 
     for r in working:
         for k in list(r.keys()):
             if k in _RESERVED_KEYS or k in _INTERNAL_KEYS or str(k).startswith("__"):
                 continue
+            cp = profile.columns.get(k)
+            if not cp:
+                continue
+
             v = r.get(k)
-            if k in email_cols and v is not None and str(v).strip():
-                if not is_valid_email(str(v)):
-                    r[k] = None
-                    invalid_changed = True
-                    if cfg.email_invalid_strategy != "placeholder":
-                        invalid_fixed_cells += 1
-            elif k in date_cols:
-                # Normalize valid dates to ISO, null out unparseable ones
-                if v is not None and str(v).strip():
-                    iso = normalize_date_value(v)
-                    if iso:
-                        if str(v).strip() != iso:
-                            invalid_fixed_cells += 1
-                        r[k] = iso
-                    else:
-                        r[k] = None
-                        invalid_changed = True
-                        invalid_fixed_cells += 1
-                else:
-                    r[k] = None
-            elif k in numeric_cols:
-                if v is None or (isinstance(v, str) and not str(v).strip()):
-                    r[k] = None
-                else:
-                    before = r.get(k)
-                    coerced = _coerce_number(v)
-                    if coerced is None and _is_present(v):
-                        invalid_changed = True
-                        invalid_fixed_cells += 1
-                    elif coerced != before and _is_present(before):
-                        invalid_fixed_cells += 1
-                    r[k] = coerced
+            if not _is_present(v):
+                continue
+
+            old_val = v
+            new_val = _normalize_value_by_type(v, cp, dataset_type)
+
+            if new_val is None and _is_present(old_val):
+                invalid_changed = True
+                invalid_fixed_cells += 1
+            elif new_val != old_val and _is_present(old_val):
+                invalid_fixed_cells += 1
+
+            r[k] = new_val
 
     if invalid_changed:
         logger.info("Invalid values replaced")
 
-    skip_numeric_impute = {k for k in numeric_cols if _should_skip_numeric_bulk_impute(working, k)}
-    skip_numeric_impute |= phone_like & numeric_cols
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PASS 2: Email placeholder (explicit opt-in)
+    # ═══════════════════════════════════════════════════════════════════════════
 
-    # Email placeholder (explicit opt-in — documented as synthetic marker).
     if cfg.email_invalid_strategy == "placeholder":
         for r in working:
             for k in email_cols:
@@ -830,71 +513,80 @@ def run_final_cleaning_layer(
                         im = r.setdefault("__imputed__", {})
                         im[k] = "placeholder"
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PASS 3: Imputation (context-aware, respects dataset type)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     values_filled_cells = 0
     text_ph_cells = 0
     filled_any = False
 
-    for k in numeric_cols:
-        if k in skip_numeric_impute:
-            continue
-        vals: list[float] = []
-        for r in working:
-            v = r.get(k)
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                vals.append(float(v))
-        if len(vals) < cfg.min_values_for_median:
-            continue
-            
-        # STRICT mode rule: only impute numerics if null rate is < 20%
-        # Otherwise, we keep them null so the strict row filter will drop them.
-        if cfg.clean_mode == "strict":
-            missing_count = sum(1 for r in working if not _is_present(r.get(k)))
-            null_rate = missing_count / len(working) if working else 1.0
-            if null_rate >= 0.20:
+    # Analytical data: NEVER impute anything
+    if dataset_type != "analytical":
+        # Numeric imputation (median) — only for columns that allow it
+        # Include monetary columns (they are also numeric)
+        imputable_numeric = numeric_cols | {n for n, c in profile.columns.items() if c.inferred_type == "monetary"}
+        for k in imputable_numeric:
+            cp = profile.columns.get(k)
+            if not cp or not cp.allows_imputation:
                 continue
-                
-        med = _median(vals)
-        if med is None:
-            continue
-        fill_value: float | int = int(med) if med == int(med) and abs(med) < 1e12 else float(med)
-        for r in working:
-            if r.get(k) is None:
-                r[k] = fill_value
-                filled_any = True
-                values_filled_cells += 1
-                if cfg.track_imputation:
-                    im = r.setdefault("__imputed__", {})
-                    im[k] = "median"
+            if k in no_impute_cols:
+                continue
 
-    # ── Row quality filtering — mode-aware ──
-    # SAFE:   keep ALL rows; only replace invalid values (already done above)
-    # STRICT: aggressively remove rows with null critical fields, invalid
-    #         emails, or missing numeric data
+            vals: list[float] = []
+            for r in working:
+                v = r.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    vals.append(float(v))
+
+            if len(vals) < cfg.min_values_for_median:
+                continue
+
+            # Strict mode: only impute if null rate < 20%
+            if cfg.clean_mode == "strict":
+                missing_count = sum(1 for r in working if not _is_present(r.get(k)))
+                null_rate = missing_count / len(working) if working else 1.0
+                if null_rate >= 0.20:
+                    continue
+
+            med = compute_median(vals)
+            if med is None:
+                continue
+            fill_value: float | int = int(med) if med == int(med) and abs(med) < 1e12 else float(med)
+            for r in working:
+                if r.get(k) is None:
+                    r[k] = fill_value
+                    filled_any = True
+                    values_filled_cells += 1
+                    if cfg.track_imputation:
+                        im = r.setdefault("__imputed__", {})
+                        im[k] = "median"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PASS 4: Row quality filtering (mode-aware)
+    # ═══════════════════════════════════════════════════════════════════════════
+
     before_filter = len(working)
     kept: list[dict[str, Any]] = []
 
-    critical_fields = infer_critical_fields(working)
+    critical_fields = profile.critical_columns
     stats["critical_fields_detected"] = critical_fields
 
     if cfg.clean_mode == "strict":
-        # Detect critical fields dynamically (high fill-rate, id-like, numeric-heavy)
-        logger.info("Strict mode | critical fields detected: %s", critical_fields)
-
+        logger.info("Strict mode | critical fields: %s", critical_fields)
         for r in working:
-            # 1. General missing-ratio filter (tight threshold)
+            # General missing-ratio filter
             if _missing_ratio(r, schema_keys) > 0.25:
                 continue
 
-            # 2. Critical fields must not be null
-            critical_missing = False
-            for cf in critical_fields:
-                if not _is_present(r.get(cf)):
-                    critical_missing = True
-                    break
+            # Critical fields must not be null
+            critical_missing = any(
+                not _is_present(r.get(cf)) for cf in critical_fields
+            )
             if critical_missing:
                 continue
 
-            # 3. Email columns must be valid (strict rejects all bad/null emails)
+            # Email columns must be valid
             email_bad = False
             for ek in email_cols:
                 ev = r.get(ek)
@@ -904,18 +596,16 @@ def run_final_cleaning_layer(
             if email_cols and email_bad:
                 continue
 
-            # 4. Numeric fields must not be missing (any missing -> drop row)
-            numeric_bad = False
-            for nk in numeric_cols:
-                if not _is_present(r.get(nk)):
-                    numeric_bad = True
-                    break
+            # Numeric fields must not be missing
+            numeric_bad = any(
+                not _is_present(r.get(nk)) for nk in numeric_cols
+            )
             if numeric_cols and numeric_bad:
                 continue
 
             kept.append(r)
     else:
-        # SAFE mode: only remove rows when 2+ critical fields are missing.
+        # SAFE mode: only remove rows when 2+ critical fields are missing
         for r in working:
             missing_critical_n = sum(1 for cf in critical_fields if not _is_present(r.get(cf)))
             if missing_critical_n >= 2:
@@ -934,16 +624,19 @@ def run_final_cleaning_layer(
     if removed:
         logger.info("%s mode | rows removed: %d", cfg.clean_mode.upper(), removed)
     stats["low_quality_removed"] = removed
-
     working = kept
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PASS 5: Text placeholder fill (only non-ID, non-phone, non-email)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    protected_cols = phone_cols | email_cols | id_like_cols
+
     for r in working:
-        _normalize_strings_inplace(r)
-        # Never fabricate values in strict mode
-        if cfg.text_missing_placeholder and text_cols and cfg.clean_mode != "strict":
+        # Text placeholder (safe mode only, non-analytical)
+        if cfg.text_missing_placeholder and cfg.clean_mode != "strict" and dataset_type != "analytical":
             for k in text_cols:
-                # Never fill phone-like, email, or ID-like text columns with placeholders
-                if k in phone_like | email_cols | id_like_text:
+                if k in protected_cols:
                     continue
                 if not _is_present(r.get(k)):
                     r[k] = cfg.text_missing_placeholder
@@ -952,6 +645,7 @@ def run_final_cleaning_layer(
                     if cfg.track_imputation:
                         im = r.setdefault("__imputed__", {})
                         im[k] = "text_placeholder"
+
         _refresh_validation_flags(r, email_cols=email_cols, date_cols=date_cols)
         r["is_anomaly"] = False
 
@@ -959,6 +653,7 @@ def run_final_cleaning_layer(
         logger.info("Missing values filled")
     stats["missing_values_filled"] = bool(filled_any or text_ph_cells)
 
+    # Ensure schema consistency
     union_keys: set[str] = set(schema_keys)
     for r in working:
         union_keys |= set(r.keys())
@@ -967,9 +662,18 @@ def run_final_cleaning_layer(
             if k not in r:
                 r[k] = None
 
-    working, dup_removed = _dedupe_identical_rows(working)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PASS 6: Deduplication (dynamic keys)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    working, dup_removed = _dedupe_by_keys(working, profile.dedup_keys)
     stats["duplicate_rows_removed"] = dup_removed
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PASS 7: Final production shaping
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # Order keys
     key_order = _schema_key_order(union_keys, include_imputed_slot=cfg.track_imputation)
     if cfg.track_imputation:
         for r in working:
@@ -981,68 +685,55 @@ def run_final_cleaning_layer(
             r.pop("__imputed__", None)
         working = [_reorder_record_keys(r, [k for k in key_order if k != "__imputed__"]) for r in working]
 
-    # Final production shaping:
-    # - remove all pipeline artifacts from row payload
-    # - normalize booleans
-    # - drop rows with null critical fields
-    # - fill non-critical nulls with safe dynamic defaults
-    content_keys = sorted(
-        {
-            k
-            for r in working
-            for k in r.keys()
-            if k not in _PIPELINE_ARTIFACT_KEYS and not str(k).startswith("__")
-        }
-    )
-    final_types = detect_field_types(working) if working else {"numeric": set(), "email": set(), "date": set(), "text": set()}
-    final_numeric = set(final_types.get("numeric", set()))
-    final_date = set(final_types.get("date", set()))
-    final_text = set(final_types.get("text", set()))
-    final_bool = _detect_boolean_columns(working, content_keys) if working else set()
-    final_critical = infer_critical_fields(working) if working else []
+    # Strip pipeline artifacts and fill remaining nulls with safe defaults
+    final_content_keys = sorted({
+        k for r in working for k in r.keys()
+        if k not in _PIPELINE_ARTIFACT_KEYS and not str(k).startswith("__")
+    })
+
+    # Re-profile for final type assignment (after cleaning)
+    final_profile = profile_dataset(working) if working else DatasetProfile()
 
     shaped: list[dict[str, Any]] = []
     dropped_for_critical = 0
+
     for row in working:
         r = _strip_pipeline_artifacts(dict(row))
 
-        # Normalize boolean values for inferred boolean columns.
-        for bk in final_bool:
+        # Re-attach __imputed__ if tracking is enabled
+        if cfg.track_imputation and row.get("__imputed__"):
+            r["__imputed__"] = row["__imputed__"]
+
+        # Normalize boolean columns
+        for bk in boolean_cols:
             if bk in r:
                 bval = _coerce_bool(r.get(bk))
                 if bval is not None:
                     r[bk] = bval
 
-        # Mode-aware critical filtering in final shaping for consistency.
-        missing_critical_n = sum(1 for cf in final_critical if not _is_present(r.get(cf)))
-        if cfg.clean_mode == "strict" and missing_critical_n >= 1:
-            dropped_for_critical += 1
-            continue
-        if cfg.clean_mode != "strict" and missing_critical_n >= 2:
-            dropped_for_critical += 1
-            continue
+        # Mode-aware critical filtering in final shaping (strict only)
+        # SAFE mode filtering already done in PASS 4 — don't re-filter here
+        if cfg.clean_mode == "strict":
+            final_critical = final_profile.critical_columns if final_profile.columns else critical_fields
+            missing_crit_n = sum(1 for cf in final_critical if not _is_present(r.get(cf)))
+            if missing_crit_n >= 1:
+                dropped_for_critical += 1
+                continue
 
-        # Fill all remaining nulls/empty values with dynamic safe defaults.
-        for k in content_keys:
+        # Fill remaining nulls with safe type-appropriate defaults
+        for k in final_content_keys:
             if not _is_present(r.get(k)):
-                r[k] = _safe_default_for_field(
-                    k,
-                    numeric_cols=final_numeric,
-                    date_cols=final_date,
-                    text_cols=final_text,
-                    bool_cols=final_bool,
-                )
+                cp = final_profile.columns.get(k) or profile.columns.get(k)
+                ctype = cp.inferred_type if cp else "text"
+                r[k] = _safe_default_for_type(ctype)
 
-        # Final hard guarantee: no residual None.
+        # Final hard guarantee: no residual None
         for k in list(r.keys()):
             if r.get(k) is None:
-                r[k] = _safe_default_for_field(
-                    k,
-                    numeric_cols=final_numeric,
-                    date_cols=final_date,
-                    text_cols=final_text,
-                    bool_cols=final_bool,
-                )
+                cp = final_profile.columns.get(k) or profile.columns.get(k)
+                ctype = cp.inferred_type if cp else "text"
+                r[k] = _safe_default_for_type(ctype)
+
         shaped.append(r)
 
     if dropped_for_critical:
@@ -1059,26 +750,24 @@ def run_final_cleaning_layer(
     )
 
     # ── Compute quality score (0.0–1.0) ──
-    # Penalize for: remaining nulls, removed rows, invalid values found
     q = 1.0
     if null_rate_after > 0:
-        q -= min(null_rate_after * 0.5, 0.25)  # up to -0.25 for nulls
+        q -= min(null_rate_after * 0.5, 0.25)
     if rows_in > 0:
         removal_ratio = (rows_in - rows_out) / rows_in
-        q -= min(removal_ratio * 0.3, 0.15)  # up to -0.15 for row removal
+        q -= min(removal_ratio * 0.3, 0.15)
     if invalid_fixed_cells > 0 and rows_in > 0:
         invalid_ratio = invalid_fixed_cells / max(rows_in * content_field_count, 1)
-        q -= min(invalid_ratio * 0.5, 0.20)  # up to -0.20 for invalids
+        q -= min(invalid_ratio * 0.5, 0.20)
     quality_score = round(max(0.0, min(1.0, q)), 4)
 
-    # Override stats explicitly for true final cleaner
     if cfg.clean_mode == "strict":
         stats["missing_values_filled"] = True
 
     stats["invalid_values_replaced"] = invalid_changed
     stats["rows_out"] = rows_out
-    stats["id_like_text_columns"] = sorted(id_like_text)
-    stats["phone_like_columns"] = sorted(phone_like)
+    stats["id_like_text_columns"] = sorted(id_like_cols)
+    stats["phone_like_columns"] = sorted(phone_cols)
     stats["cleaning_summary"] = {
         "rows_removed": rows_in - rows_out,
         "values_filled": values_filled_cells,
@@ -1091,6 +780,10 @@ def run_final_cleaning_layer(
     return working, stats
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Output writer
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def write_cleaning_outputs(
     document_id: str,
     validated_payload: dict[str, Any],
@@ -1100,8 +793,7 @@ def write_cleaning_outputs(
     output_dir: str | os.PathLike[str] | None = None,
 ) -> dict[str, str]:
     """
-    Write ``validated_output.json`` (flags + anomalies) and
-    ``final_cleaned_output.json`` (production rows + cleaning summary).
+    Write ``validated_output.json`` and ``final_cleaned_output.json``.
     Returns paths written.
     """
     root = Path(output_dir or os.getenv("AITL_OUTPUT_DIR", "output"))
@@ -1125,7 +817,6 @@ def write_cleaning_outputs(
         "row_count": len(final_rows),
         "final_cleaned_output": final_rows,
     }
-    # Include cleaning summary so the output file is self-contained and analysis-ready
     if cleaning_stats:
         final_body["cleaning_summary"] = cleaning_stats.get("cleaning_summary", {})
         final_body["field_types"] = cleaning_stats.get("field_types", {})
@@ -1136,129 +827,3 @@ def write_cleaning_outputs(
     logger.info("Wrote validated output | path=%s", inter_path)
     logger.info("Wrote final cleaned output | path=%s", final_path)
     return {"validated": str(inter_path.resolve()), "final": str(final_path.resolve())}
-
-
-import collections
-import statistics
-from typing import Any
-
-def _clean_text_noise(text: str) -> str:
-    """Removes brackets, parentheses, and citation markers like † ‡ * from strings."""
-    # Strip everything inside [] or ()
-    t = re.sub(r'\[.*?\]', '', text)
-    t = re.sub(r'\(.*?\)', '', t)
-    # Strip specific garbage characters
-    t = re.sub(r'[†‡\*^]', '', t)
-    return t.strip()
-
-def dynamic_adaptive_cleaning(records: list[dict[str, Any]], critical_fields: list[str]) -> list[dict[str, Any]]:
-    """Fully dynamic cleaner: detects noise, infers types, imputes via median/mode, drops missing criticals."""
-    if not records:
-        return []
-
-    # 0. Deep pre-clean string noises so that '1[4]' correctly becomes '1' and infers to Numeric
-    for r in records:
-        for k, v in r.items():
-            if isinstance(v, str):
-                r[k] = _clean_text_noise(v)
-
-    # 1. Strip validation noise
-    noise_prefixes = ("is_", "confidence")
-    noise_suffixes = ("_score",)
-    noise_exact = ("ref", "references", "annotation", "notes")
-    
-    schema_keys = set()
-    for r in records:
-        for k in r.keys():
-            k_lower = k.lower()
-            if not k_lower.startswith(noise_prefixes) and not k_lower.endswith(noise_suffixes):
-                if k_lower not in noise_exact and k != "__imputed__":
-                    schema_keys.add(k)
-                
-    schema_keys_list = sorted(list(schema_keys))
-    
-    # 2. Field profiling
-    numeric_fields = set()
-    categorical_fields = set()
-    
-    for k in schema_keys_list:
-        num_count = 0
-        total_count = 0
-        for r in records:
-            v = r.get(k)
-            if v is not None and str(v).strip() != "":
-                total_count += 1
-                try:
-                    float(v)
-                    num_count += 1
-                except (ValueError, TypeError):
-                    pass
-        if total_count > 0 and (num_count / total_count) > 0.8:
-            numeric_fields.add(k)
-        else:
-            categorical_fields.add(k)
-            
-    # 3. Compute Medians and Modes
-    medians: dict[str, float] = {}
-    for nk in numeric_fields:
-        vals = []
-        for r in records:
-            v = r.get(nk)
-            if v is not None and str(v).strip() != "":
-                try:
-                    vals.append(float(v))
-                except: pass
-        if vals:
-            medians[nk] = statistics.median(vals)
-            
-    modes: dict[str, Any] = {}
-    for ck in categorical_fields:
-        counts = collections.Counter()
-        for r in records:
-            v = r.get(ck)
-            if v is not None and str(v).strip() != "":
-                counts[str(v).strip()] += 1
-        if counts:
-            modes[ck] = counts.most_common(1)[0][0]
-            
-    # 4. Row filtering and Imputation
-    cleaned = []
-    for r in records:
-        # CRITICAL FILTER
-        missing_critical = False
-        for cf in critical_fields:
-            if cf in r:
-                v = r.get(cf)
-                if v is None or str(v).strip() == "" or str(v).lower() in ("unknown", "error", "invalid"):
-                    missing_critical = True
-                    break
-        if missing_critical:
-            continue
-            
-        new_row = {}
-        for k in schema_keys_list:
-            v = r.get(k)
-            v_str = str(v).strip()
-            is_empty = (v is None or v_str == "" or v_str.lower() in ("unknown", "error", "invalid"))
-            
-            if k in numeric_fields:
-                if is_empty:
-                    new_row[k] = medians.get(k, 0.0)
-                else:
-                    try:
-                        new_row[k] = float(v)
-                    except:
-                        new_row[k] = medians.get(k, 0.0)
-            else:
-                if is_empty:
-                    new_row[k] = modes.get(k, "Unknown")
-                else:
-                    # standardize to proper case unless it's an email
-                    if "@" in v_str and "." in v_str:
-                        new_row[k] = v_str.lower()
-                    else:
-                        new_row[k] = v_str.title()
-                        
-        cleaned.append(new_row)
-        
-    return cleaned

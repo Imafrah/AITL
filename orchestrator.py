@@ -41,36 +41,59 @@ def sample_csv_text(text: str, max_chars: int = 10000) -> str:
 
 def detect_document_type(text: str, filename: str) -> str:
     """
-    Detect document type from content keywords and filename.
-    Runs on FULL text before truncation for accuracy.
+    Detect document type from content PATTERNS — no hardcoded keyword lists.
+
+    Uses statistical analysis of the text to classify:
+    - Presence of structured numeric patterns (amounts, dates)
+    - Text density and structure
+    - Pattern-based detection
     """
-    text_lower = text[:5000].lower()  # check first 5000 chars only for speed
-    filename_lower = filename.lower()
+    import re
 
-    if any(k in text_lower or k in filename_lower
-           for k in ["invoice", "inv-", "bill", "payment due", "amount due"]):
-        return "invoice"
+    text_sample = text[:5000].lower() if text else ""
+    filename_lower = filename.lower() if filename else ""
 
-    if any(k in text_lower or k in filename_lower
-           for k in ["employee", "employer", "emp_", "salary", "department",
-                     "dept", "staff", "hr_", "joining", "date_of_birth", "dob"]):
-        return "employee_record"
+    if not text_sample.strip():
+        return "unknown"
 
-    if any(k in text_lower or k in filename_lower
-           for k in ["transaction", "debit", "credit", "balance", "account",
-                     "financial", "ledger", "statement"]):
-        return "financial_report"
+    # Count pattern occurrences (value-based, not keyword-based)
+    amount_pattern = re.compile(r'[$€£₹¥]\s*[\d,]+\.?\d*|\b\d{1,3}(?:,\d{3})+\.\d{2}\b')
+    date_pattern = re.compile(r'\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b')
+    email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 
-    if any(k in text_lower or k in filename_lower
-           for k in ["agreement", "contract", "terms", "party", "clause",
-                     "signed", "hereby"]):
-        return "contract"
+    amount_count = len(amount_pattern.findall(text_sample))
+    date_count = len(date_pattern.findall(text_sample))
+    email_count = len(email_pattern.findall(text_sample))
 
-    if any(k in text_lower or k in filename_lower
-           for k in ["memo", "subject:", "re:", "memorandum"]):
-        return "memo"
+    # Line structure analysis
+    lines = text_sample.split('\n')
+    non_empty_lines = [l for l in lines if l.strip()]
+    total_lines = len(non_empty_lines)
 
-    return "unknown"
+    # Check for tabular structure (comma-separated or tab-separated)
+    comma_lines = sum(1 for l in non_empty_lines if l.count(',') >= 2)
+    tab_lines = sum(1 for l in non_empty_lines if l.count('\t') >= 2)
+    is_tabular = (comma_lines / max(total_lines, 1) > 0.5 or
+                  tab_lines / max(total_lines, 1) > 0.5)
+
+    # Infer type from patterns
+    if is_tabular:
+        return "tabular_data"
+
+    # High density of monetary values → financial document
+    if amount_count >= 3:
+        return "financial_document"
+
+    # Mix of dates and structured text → structured record
+    if date_count >= 2 and total_lines >= 5:
+        return "structured_document"
+
+    # Long-form text with few patterns → narrative/memo
+    avg_line_len = sum(len(l) for l in non_empty_lines) / max(total_lines, 1)
+    if avg_line_len > 80 and amount_count <= 1:
+        return "narrative_document"
+
+    return "generic_document"
 
 
 def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
@@ -91,7 +114,7 @@ def run_pipeline(file_bytes: bytes, file_type: str, filename: str) -> dict:
             "metadata": {"file_type": file_type}
         }
 
-    # Step 2: Detect document type from full text + filename
+    # Step 2: Detect document type from full text + filename (pattern-based)
     document_type = detect_document_type(parsed["text"], filename)
     logger.info(f"Document type detected: {document_type}")
 

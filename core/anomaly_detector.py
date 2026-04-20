@@ -1,4 +1,9 @@
-"""Dataset-agnostic anomalies: critical fields, formats, and per-column 3× mean outliers."""
+"""
+Dataset-agnostic anomaly detection: critical fields, format validation,
+and per-column statistical outlier detection.
+
+Uses dynamically detected column types — no hardcoded field names.
+"""
 
 from __future__ import annotations
 
@@ -34,8 +39,16 @@ def _numeric_column_means(records: list[dict[str, Any]]) -> dict[str, float]:
 def apply_anomaly_detection(
     records: list[dict[str, Any]],
     critical_fields: list[str] | None = None,
+    *,
+    email_columns: set[str] | None = None,
+    date_columns: set[str] | None = None,
 ) -> None:
-    """Mutates ``is_anomaly`` in place (OR semantics)."""
+    """
+    Mutates ``is_anomaly`` in place (OR semantics).
+
+    Uses dynamically provided column sets for email/date validation.
+    Falls back to checking validation flags if column sets not provided.
+    """
     critical_fields = critical_fields or []
     col_means = _numeric_column_means(records)
 
@@ -47,15 +60,31 @@ def apply_anomaly_detection(
             bad = True
             logger.debug("Anomaly | invalid_numeric")
 
-        if r.get("email") is not None and str(r.get("email")).strip():
-            if not is_valid_email(r.get("email")):
-                bad = True
-                logger.debug("Anomaly | invalid_email")
+        # Check email columns dynamically
+        if email_columns:
+            for ek in email_columns:
+                ev = r.get(ek)
+                if ev is not None and str(ev).strip():
+                    if not is_valid_email(str(ev)):
+                        bad = True
+                        logger.debug("Anomaly | invalid_email in column=%s", ek)
+                        break
+        elif r.get("is_valid_email") is False:
+            bad = True
+            logger.debug("Anomaly | invalid_email (from flag)")
 
-        if r.get("date") is not None and str(r.get("date")).strip():
-            if not is_valid_date(r.get("date")):
-                bad = True
-                logger.debug("Anomaly | invalid_date")
+        # Check date columns dynamically
+        if date_columns:
+            for dk in date_columns:
+                dv = r.get(dk)
+                if dv is not None and str(dv).strip():
+                    if not is_valid_date(dv):
+                        bad = True
+                        logger.debug("Anomaly | invalid_date in column=%s", dk)
+                        break
+        elif r.get("is_valid_date") is False:
+            bad = True
+            logger.debug("Anomaly | invalid_date (from flag)")
 
         if critical_fields:
             for cf in critical_fields:
@@ -80,9 +109,7 @@ def apply_anomaly_detection(
                     bad = True
                     logger.debug(
                         "Anomaly | outlier column=%s value=%s mean=%s",
-                        k,
-                        fv,
-                        round(mean, 4),
+                        k, fv, round(mean, 4),
                     )
                     break
 

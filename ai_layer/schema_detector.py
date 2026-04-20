@@ -1,3 +1,10 @@
+"""
+AI-powered schema detection — open-ended column type classification.
+
+The model classifies columns by VALUE PATTERNS, not fixed semantic roles.
+Returns a flexible mapping dict, not a rigid Pydantic model with hardcoded fields.
+"""
+
 import json
 import logging
 import time
@@ -17,18 +24,21 @@ class SchemaDetectionError(Exception):
 
 
 class SchemaMappingModel(BaseModel):
-    """Semantic roles → CSV column names from the file (exact spelling as in sample)."""
+    """Open-ended semantic roles → CSV column names (exact spelling from data)."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="allow")
 
+    # Core value-pattern-based roles (not fixed schema fields)
     person_name: list[str] = Field(default_factory=list)
     email: list[str] = Field(default_factory=list)
     phone: list[str] = Field(default_factory=list)
-    city: list[str] = Field(default_factory=list)
+    location: list[str] = Field(default_factory=list)
     organization: list[str] = Field(default_factory=list)
     date: list[str] = Field(default_factory=list)
     amount: list[str] = Field(default_factory=list)
     currency: list[str] = Field(default_factory=list)
+    identifier: list[str] = Field(default_factory=list)
+    category: list[str] = Field(default_factory=list)
 
 
 class SchemaAIDetection(BaseModel):
@@ -36,14 +46,15 @@ class SchemaAIDetection(BaseModel):
 
     schema_type: str = Field(
         default="generic",
-        description="One of: employee, transaction, invoice, sales, generic",
+        description="Dataset classification: entity, transactional, analytical, or generic",
     )
     mapping: SchemaMappingModel = Field(default_factory=SchemaMappingModel)
 
 
 def detect_schema_ai(sample_rows: list[dict], api_key: str) -> dict:
     """
-    Ask the model which columns mean what. Caller must validate mapping before use.
+    Ask the model to classify columns by VALUE PATTERNS.
+    Returns flexible mapping that callers validate against actual columns.
     """
     if not api_key or not str(api_key).strip():
         raise SchemaDetectionError("API key is required for AI schema detection.")
@@ -66,23 +77,30 @@ def detect_schema_ai(sample_rows: list[dict], api_key: str) -> dict:
         schema_dict = SchemaAIDetection.model_json_schema()
         clean_schema = remove_additional_properties(schema_dict)
 
-        prompt = f"""You are a data analyst.
+        prompt = f"""You are a data analyst. Analyze the columns in these CSV rows by examining their VALUE PATTERNS.
 
 Given these CSV rows as JSON (column names are exact — reuse them in mapping values):
 
-1. Pick schema_type: one of employee, transaction, invoice, sales, generic.
-2. Fill mapping lists with the EXACT column names from the data that best match each role.
-   Leave a list empty if there is no suitable column.
+1. Classify the dataset type based on column relationships:
+   - "entity": describes people/things (has names, contact info, identifiers)
+   - "transactional": describes events (has dates, amounts, IDs, status)
+   - "analytical": mostly numeric data/metrics/statistics
+   - "generic": doesn't fit above categories
 
-Roles:
-- person_name: person or client name
-- email: email address column
-- phone: phone, mobile, fax column
-- city: city, town, postal/region if clearly geographic (not street address text)
-- organization: company, vendor, department, merchant, supplier
-- date: any date/datetime column
-- amount: money, price, cost, salary, quantity-as-number if clearly monetary context
-- currency: ISO or symbol column if separate from amount
+2. Map each column to its detected ROLE based on value patterns:
+   - person_name: columns where values look like human names (2+ capitalized words)
+   - email: columns where values contain @ and domain patterns
+   - phone: columns with 10-15 digit numeric sequences
+   - location: columns with city/region/country names
+   - organization: columns with company/department/institution names
+   - date: columns where values are parseable as dates
+   - amount: columns with monetary or significant numeric values
+   - currency: columns with ISO currency codes or symbols
+   - identifier: columns with unique codes/IDs/serial numbers
+   - category: columns with low-cardinality text values (statuses, types)
+
+   Leave a list empty if no column matches that role.
+   Use EXACT column names from the data.
 
 Rows:
 {json.dumps(safe_sample, indent=2, default=str)}

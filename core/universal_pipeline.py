@@ -3,6 +3,8 @@ Universal file intelligence pipeline — hybrid rules + AI, SQLite schema memory
 row-level universal output.
 
 Flow: parse → clean → validate → analyze → **final cleaning** (repair + schema-unify).
+
+All decisions driven by DatasetProfile — no hardcoded column names or schema types.
 """
 
 from __future__ import annotations
@@ -18,14 +20,18 @@ from typing import Any
 from core.analytics_engine import compute_analytics
 from core.anomaly_detector import apply_anomaly_detection
 from core.cleaning import (
-    build_clean_row,
     is_valid_date,
     is_valid_email,
     is_valid_phone,
     is_valid_salary,
 )
 from core.dashboard_formatter import build_dashboard
-from core.intelligent_cleaner import detect_field_types, run_final_cleaning_layer, write_cleaning_outputs
+from core.data_profiler import (
+    detect_field_types,
+    profile_dataset,
+    _is_present,
+)
+from core.final_cleaning import run_final_cleaning_layer, write_cleaning_outputs
 from core.file_router import route_file as classify_file
 from core.intelligence_record import coerce_intelligence_row, dedupe_intelligence_rows
 from core.output_formatter import to_table
@@ -40,14 +46,6 @@ from core.schema_memory import get_schema_from_memory, save_schema_to_memory
 logger = logging.getLogger(__name__)
 
 MAX_CSV_ROWS = int(__import__("os").getenv("AITL_MAX_CSV_ROWS", "100000"))
-
-
-def _is_present(v: Any) -> bool:
-    if v is None:
-        return False
-    if isinstance(v, str) and not v.strip():
-        return False
-    return True
 
 
 def _is_numeric_like(v: Any) -> bool:
@@ -65,11 +63,13 @@ def _is_numeric_like(v: Any) -> bool:
 
 
 def _build_validation_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
-    field_types = detect_field_types(rows) if rows else {"numeric": set(), "email": set(), "date": set(), "sensitive": set()}
-    numeric_cols = set(field_types.get("numeric", set()))
+    """Build validation summary using dynamic field type detection."""
+    field_types = detect_field_types(rows) if rows else {}
+    numeric_cols = set(field_types.get("numeric", set())) | set(field_types.get("monetary", set()))
     date_cols = set(field_types.get("date", set()))
     email_cols = set(field_types.get("email", set()))
-    
+    phone_cols = set(field_types.get("phone", set()))
+
     valid_numeric_cells = 0
     valid_salary_cells = 0
     for r in rows:
@@ -87,25 +87,18 @@ def _build_validation_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
                 valid_date_rows += 1
     else:
         valid_date_rows = len(rows)
-        
+
     valid_email_count = 0
     if email_cols:
         for r in rows:
             if any(is_valid_email(r.get(k)) for k in email_cols):
                 valid_email_count += 1
-                
-    # Detect phone dynamically (heuristic inside validation)
-    phone_cols = set()
-    if rows:
-        for k in rows[0].keys():
-            if k in field_types.get("sensitive", set()) or "phone" in str(k).lower():
-                phone_cols.add(k)
-                
+
     valid_phone_count = 0
     if phone_cols:
-         for r in rows:
-             if any(is_valid_phone(r.get(k)) for k in phone_cols):
-                 valid_phone_count += 1
+        for r in rows:
+            if any(is_valid_phone(r.get(k)) for k in phone_cols):
+                valid_phone_count += 1
 
     return {
         "valid_email_count": valid_email_count,
@@ -119,68 +112,60 @@ def _build_validation_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
 def structured_doc_to_row(doc: dict[str, Any]) -> dict[str, Any]:
     """One legacy structured document → one universal row."""
     e = doc.get("entities") or {}
-    confs: list[float] = []
+    row: dict[str, Any] = {}
 
-    p0 = (e.get("person_names") or [None])[0]
-    if p0:
-        pn = p0.get("value")
-        confs.append(float(p0.get("confidence", 0.9)))
-    else:
-        pn = None
+    # Extract all entity types generically
+    for entity_type, items in e.items():
+        if not isinstance(items, list) or not items:
+            continue
+        first = items[0]
+        if isinstance(first, dict) and "value" in first:
+            row[entity_type] = first["value"]
 
-    o0 = (e.get("organizations") or [None])[0]
-    if o0:
-        org = o0.get("value")
-        confs.append(float(o0.get("confidence", 0.88)))
-    else:
-        org = None
+    row["confidence"] = 0.75
+    row["is_anomaly"] = False
+    row["is_valid_email"] = True
+    row["is_valid_date"] = True
+    row["is_valid_numeric"] = True
 
-    d0 = (e.get("dates") or [None])[0]
-    if d0:
-        dv = d0.get("value")
-        confs.append(float(d0.get("confidence", 0.82)))
-    else:
-        dv = None
-
-    a0 = (e.get("amounts") or [None])[0]
-    amt = None
-    if a0:
-        amt = a0.get("value")
-        confs.append(float(a0.get("confidence", 0.86)))
-
-    conf = sum(confs) / len(confs) if confs else 0.75
-    return build_clean_row(pn, org, amt, dv, conf)
+    return row
 
 
 def generic_doc_to_rows(doc: dict[str, Any]) -> list[dict[str, Any]]:
-    """Expand generic_csv-style multi-entity document into universal rows."""
+    """Expand generic multi-entity document into universal rows."""
     e = doc.get("entities") or {}
-    p = e.get("person_names") or []
-    o = e.get("organizations") or []
-    d = e.get("dates") or []
-    a = e.get("amounts") or []
-    n = max(len(p), len(o), len(d), len(a), 1)
+    
+    # Find all entity lists and their lengths
+    entity_lists: dict[str, list] = {}
+    for key, items in e.items():
+        if isinstance(items, list) and items:
+            entity_lists[key] = items
+
+    if not entity_lists:
+        return [{"confidence": 0.5, "is_anomaly": False, "is_valid_email": True, "is_valid_date": True, "is_valid_numeric": True}]
+
+    n = max(len(v) for v in entity_lists.values())
     rows: list[dict[str, Any]] = []
+
     for i in range(n):
-        pi = p[i] if i < len(p) else None
-        oi = o[i] if i < len(o) else None
-        di = d[i] if i < len(d) else None
-        ai = a[i] if i < len(a) else None
-        confs = [x for x in [pi, oi, di, ai] if x]
-        conf = (
-            sum(float(x.get("confidence", 0.8)) for x in confs) / len(confs) if confs else 0.7
-        )
-        rows.append(
-            build_clean_row(
-                pi.get("value") if pi else None,
-                oi.get("value") if oi else None,
-                ai.get("value") if ai else None,
-                di.get("value") if di else None,
-                conf,
-            )
-        )
-    if not any(r.get("person_name") or r.get("organization") or r.get("amount") for r in rows):
-        return [build_clean_row(None, None, None, None, 0.5)]
+        row: dict[str, Any] = {}
+        confs: list[float] = []
+        for key, items in entity_lists.items():
+            item = items[i] if i < len(items) else None
+            if item and isinstance(item, dict):
+                row[key] = item.get("value")
+                confs.append(float(item.get("confidence", 0.8)))
+
+        row["confidence"] = sum(confs) / len(confs) if confs else 0.7
+        row["is_anomaly"] = False
+        row["is_valid_email"] = True
+        row["is_valid_date"] = True
+        row["is_valid_numeric"] = True
+        rows.append(row)
+
+    if not any(any(v for k, v in r.items() if k not in ("confidence", "is_anomaly", "is_valid_email", "is_valid_date", "is_valid_numeric")) for r in rows):
+        return [{"confidence": 0.5, "is_anomaly": False, "is_valid_email": True, "is_valid_date": True, "is_valid_numeric": True}]
+
     return rows
 
 
@@ -192,40 +177,41 @@ def document_to_universal_rows(doc: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def entities_to_universal_rows(entities: dict[str, Any]) -> list[dict[str, Any]]:
-    """Post-process / AI-style entity lists → universal rows (unstructured)."""
-    p = entities.get("person_names") or []
-    o = entities.get("organizations") or []
-    d = entities.get("dates") or []
-    a = entities.get("amounts") or []
-    n = max(len(p), len(o), len(d), len(a), 1)
+    """Post-process / AI-style entity lists → universal rows."""
+    entity_lists: dict[str, list] = {}
+    for key, items in entities.items():
+        if isinstance(items, list) and items:
+            entity_lists[key] = items
+
+    if not entity_lists:
+        return [{"confidence": 0.75, "is_anomaly": False, "is_valid_email": True, "is_valid_date": True, "is_valid_numeric": True}]
+
+    n = max(len(v) for v in entity_lists.values())
     out: list[dict[str, Any]] = []
+
     for i in range(n):
-        pi = p[i] if i < len(p) else None
-        oi = o[i] if i < len(o) else None
-        di = d[i] if i < len(d) else None
-        ai = a[i] if i < len(a) else None
-        parts = [x for x in [pi, oi, di, ai] if x]
-        conf = (
-            sum(float(x.get("confidence", 0.85)) for x in parts) / len(parts) if parts else 0.75
-        )
-        out.append(
-            build_clean_row(
-                pi.get("value") if pi else None,
-                oi.get("value") if oi else None,
-                ai.get("value") if ai else None,
-                di.get("value") if di else None,
-                conf,
-            )
-        )
-    if not any(
-        r.get("person_name") or r.get("organization") or r.get("amount") for r in out
-    ):
-        out = [build_clean_row(None, None, None, None, 0.5)]
+        row: dict[str, Any] = {}
+        parts: list[float] = []
+        for key, items in entity_lists.items():
+            item = items[i] if i < len(items) else None
+            if item and isinstance(item, dict):
+                row[key] = item.get("value")
+                parts.append(float(item.get("confidence", 0.85)))
+
+        row["confidence"] = sum(parts) / len(parts) if parts else 0.75
+        row["is_anomaly"] = False
+        row["is_valid_email"] = True
+        row["is_valid_date"] = True
+        row["is_valid_numeric"] = True
+        out.append(row)
+
+    if not any(any(v for k, v in r.items() if k not in ("confidence", "is_anomaly", "is_valid_email", "is_valid_date", "is_valid_numeric")) for r in out):
+        out = [{"confidence": 0.5, "is_anomaly": False, "is_valid_email": True, "is_valid_date": True, "is_valid_numeric": True}]
+
     return out
 
 
 def _csv_cache_is_usable(cached: dict[str, Any]) -> bool:
-    """Trust cache when it has a modern envelope or an explicit mapping dict (incl. empty)."""
     if "source" in cached:
         return True
     return isinstance(cached.get("mapping"), dict)
@@ -262,7 +248,8 @@ def _process_structured_csv(
             break
 
     memory_hit = False
-    base_fm = classify_fields(columns)
+    # Use profiler-driven classification with sample data
+    base_fm = classify_fields(columns, sample_rows=sample if sample else None)
     valid_columns = {str(c).strip() for c in columns if c is not None and str(c).strip()}
     field_map: dict[str, list[str]] = {k: list(v) for k, v in base_fm.items() if v}
     schema_source = "heuristic"
@@ -281,7 +268,6 @@ def _process_structured_csv(
         if field_map_needs_ai(field_map) and sample and api_key and str(api_key).strip():
             try:
                 from ai_layer.schema_detector import detect_schema_ai
-
                 ai = detect_schema_ai(sample, api_key)
                 ai_m = ai.get("mapping") or {}
                 merged = merge_field_maps(field_map, ai_m, valid_columns=valid_columns)
@@ -313,9 +299,7 @@ def _process_structured_csv(
             if field_map_nonempty(field_map):
                 data_rows.append(
                     semantic_intelligence_row(
-                        row,
-                        field_map,
-                        schema_source=schema_source,
+                        row, field_map, schema_source=schema_source,
                     )
                 )
             else:
@@ -405,18 +389,14 @@ def _process_unstructured(
 
     try:
         ai_output = extract_entities(
-            text_for_ai,
-            api_key=api_key,
-            document_type=document_type,
+            text_for_ai, api_key=api_key, document_type=document_type,
         )
     except AIServiceError as e:
         return _with_fallback(str(e))
 
     try:
         result = post_process(
-            ai_output,
-            source_file=filename,
-            file_metadata=parsed["metadata"],
+            ai_output, source_file=filename, file_metadata=parsed["metadata"],
         )
     except ValidationError as e:
         return _with_fallback(str(e))
@@ -444,9 +424,8 @@ def process_universal(
     """
     Main entry: returns universal envelope.
 
-    Stages: parse → clean → validate → analyze → final cleaning (type repair, imputation,
-    schema enforcement, row QC). ``output_format``: json | table | csv | dashboard
-    (csv returns raw bytes from the route; dashboard adds summary + charts + sample rows).
+    Stages: parse → clean → validate → analyze → final cleaning.
+    All decisions driven by DatasetProfile — no hardcoded schemas.
     """
     kind = classify_file(filename or "")
     document_id = str(uuid.uuid4())
@@ -503,17 +482,31 @@ def process_universal(
     if semantic_map:
         logger.info("Semantic grouping applied")
     if any(norm_flags):
-        logger.info("Duplicate fields removed")
+        logger.info("Schema normalized")
 
     critical = infer_critical_fields(data)
     meta["critical_fields"] = critical
-    apply_anomaly_detection(data, critical_fields=critical)
+
+    # Profile for dynamic column type detection
+    profile = profile_dataset(data) if data else None
+    email_cols = set()
+    date_cols = set()
+    if profile:
+        for name, cp in profile.columns.items():
+            if cp.inferred_type == "email":
+                email_cols.add(name)
+            elif cp.inferred_type == "date":
+                date_cols.add(name)
+
+    apply_anomaly_detection(
+        data, critical_fields=critical,
+        email_columns=email_cols if email_cols else None,
+        date_columns=date_cols if date_cols else None,
+    )
     _anomaly_n = sum(1 for r in data if r.get("is_anomaly"))
     if _anomaly_n:
-        logger.info(
-            "Anomaly detected based on dynamic rules | affected_records=%s",
-            _anomaly_n,
-        )
+        logger.info("Anomaly detected | affected_records=%s", _anomaly_n)
+
     any_conf_adj = False
     for r, had_norm in zip(data, norm_flags):
         conf, adj = compute_adaptive_confidence(
@@ -524,12 +517,12 @@ def process_universal(
             any_conf_adj = True
     if any_conf_adj:
         logger.info("Confidence adjusted dynamically")
+
     analytics = compute_analytics(data)
     validation_summary = _build_validation_summary(data)
 
     if not data:
         from core.fallback_extractor import fallback_extract
-
         logger.warning("Empty data after processing; injecting fallback placeholder")
         raw_fb = [coerce_intelligence_row(r) for r in fallback_extract("")]
         st = "partial"
@@ -555,12 +548,10 @@ def process_universal(
     if final_status == "failed" and data:
         final_status = "partial"
 
-    cleaned_data, cleaning_stats = run_final_cleaning_layer(data, api_key=api_key)
-    # Validation must reflect the cleaned output to avoid contradictory metadata.
+    cleaned_data, cleaning_stats = run_final_cleaning_layer(data)
     validation_summary = _build_validation_summary(cleaned_data)
-    critical_for_metadata = cleaning_stats.get("critical_fields_detected") or infer_critical_fields(
-        cleaned_data
-    )
+    critical_for_metadata = cleaning_stats.get("critical_fields_detected") or infer_critical_fields(cleaned_data)
+
     intermediate_metadata: dict[str, Any] = {
         "file_type": meta.get("file_type", "unknown"),
         "row_count": len(data),
@@ -573,14 +564,12 @@ def process_universal(
         intermediate_metadata["extraction"] = meta["extraction"]
     if meta.get("semantic_map") is not None:
         intermediate_metadata["semantic_map"] = meta.get("semantic_map")
+
     output_paths: dict[str, str] = {}
     try:
         output_paths = write_cleaning_outputs(
             document_id,
-            {
-                "validated_output": copy.deepcopy(data),
-                "metadata": intermediate_metadata,
-            },
+            {"validated_output": copy.deepcopy(data), "metadata": intermediate_metadata},
             cleaned_data,
             cleaning_stats=cleaning_stats,
         )
@@ -612,7 +601,6 @@ def process_universal(
     # Persist universal envelope (best-effort)
     try:
         from db.crud import save_document
-
         save_document(
             document_id=document_id,
             source_file=filename or "upload",

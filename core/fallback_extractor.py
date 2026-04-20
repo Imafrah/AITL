@@ -1,6 +1,8 @@
 """
 Lightweight regex-based extraction when the AI service is unavailable or fails.
 Does not replace the full pipeline — only guarantees non-empty structured rows.
+
+Output is GENERIC — no hardcoded field names in row structure.
 """
 
 from __future__ import annotations
@@ -30,6 +32,12 @@ _NAME_PATTERN = re.compile(
 )
 
 _MAX_ROWS = 10
+
+# Common false positives for name detection
+_NAME_FALSE_POSITIVES = frozenset({
+    "total amount", "invoice date", "due date", "payment method",
+    "grand total", "sub total", "bank transfer", "credit card",
+})
 
 
 def _find_dates(text: str) -> list[str]:
@@ -75,8 +83,7 @@ def _find_names(text: str) -> list[str]:
         low = name.lower()
         if low in seen or len(name) < 4:
             continue
-        # Skip common false positives
-        if low in ("total amount", "invoice date", "due date", "payment method"):
+        if low in _NAME_FALSE_POSITIVES:
             continue
         seen.add(low)
         out.append(name)
@@ -86,26 +93,22 @@ def _find_names(text: str) -> list[str]:
 
 
 def _empty_row(confidence: float = 0.35) -> dict[str, Any]:
+    """Generic empty row — no hardcoded field names."""
     return {
-        "person_name": None,
-        "organization": None,
-        "amount": None,
-        "date": None,
         "confidence": confidence,
-        "is_outlier": False,
-        "name": None,
-        "email": None,
-        "phone": None,
-        "city": None,
-        "salary": None,
         "is_anomaly": False,
+        "is_valid_email": True,
+        "is_valid_date": True,
+        "is_valid_numeric": True,
     }
 
 
 def fallback_extract(text: str) -> list[dict[str, Any]]:
     """
     Regex-only extraction: names, amounts, dates.
-    Always returns at least one row (possibly all-null) so callers never ship [].
+    Always returns at least one row (possibly minimal) so callers never ship [].
+
+    Output keys are generic labels based on detection patterns.
     """
     if not text or not str(text).strip():
         return [_empty_row()]
@@ -122,25 +125,26 @@ def fallback_extract(text: str) -> list[dict[str, Any]]:
     n = min(_MAX_ROWS, max(len(names), len(amounts), len(dates), 1))
     rows: list[dict[str, Any]] = []
     for i in range(n):
+        row: dict[str, Any] = {}
+
         pn = names[i] if i < len(names) else (names[0] if names else None)
         amt = amounts[i] if i < len(amounts) else (amounts[0] if amounts else None)
         dt = dates[i] if i < len(dates) else (dates[0] if dates else None)
         iso = parse_date(str(dt)) if dt else None
-        rows.append(
-            {
-                "person_name": pn,
-                "name": pn,
-                "organization": None,
-                "city": None,
-                "email": None,
-                "phone": None,
-                "amount": amt,
-                "salary": amt,
-                "date": iso or (str(dt)[:32] if dt else None),
-                "confidence": 0.5,
-                "is_outlier": False,
-                "is_anomaly": False,
-            }
-        )
+
+        if pn:
+            row["detected_name"] = pn
+        if amt is not None:
+            row["detected_amount"] = amt
+        if iso or dt:
+            row["detected_date"] = iso or (str(dt)[:32] if dt else None)
+
+        row["confidence"] = 0.5
+        row["is_anomaly"] = False
+        row["is_valid_email"] = True
+        row["is_valid_date"] = True if (not dt or iso) else False
+        row["is_valid_numeric"] = True
+
+        rows.append(row)
 
     return rows

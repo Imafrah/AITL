@@ -1,6 +1,9 @@
 """
-Dataset-agnostic semantic column classification: keyword similarity on normalized headers,
-row-level semantic extraction. No dataset-type labels — roles are generic.
+Dataset-agnostic semantic column classification: value-pattern-based detection,
+row-level semantic extraction.
+
+Column roles are inferred from DATA PATTERNS, not keyword matching on column names.
+The profiler drives all type decisions.
 """
 
 from __future__ import annotations
@@ -9,6 +12,13 @@ import logging
 from typing import Any
 
 from core.cleaning import amount_from_value
+from core.data_profiler import (
+    _is_present,
+    _looks_like_email,
+    _looks_like_phone,
+    _looks_like_date,
+    profile_column,
+)
 from parsers.csv_parser import normalize_field_name
 
 logger = logging.getLogger(__name__)
@@ -22,165 +32,6 @@ _INVALID_SOURCE_KEY_FRAGMENTS = (
     "metadata",
 )
 
-# Semantic roles (priority order for assignment: first match wins per column).
-# quantity is strictly separated from monetary amount / salary.
-_ROLE_SPECS: tuple[tuple[str, frozenset[str]], ...] = (
-    ("email", frozenset({"email", "e_mail", "mail", "mailbox"})),
-    ("phone", frozenset({"phone", "tel", "mobile", "cell", "fax", "whatsapp"})),
-    (
-        "quantity",
-        frozenset(
-            {
-                "quantity",
-                "qty",
-                "units",
-                "items_ordered",
-                "units_sold",
-                "pieces",
-                "count_items",
-                "num_items",
-            }
-        ),
-    ),
-    ("status", frozenset({"status", "phase", "payment_status", "order_status", "workflow"})),
-    (
-        "date",
-        frozenset(
-            {
-                "date",
-                "time",
-                "timestamp",
-                "due",
-                "invoice_date",
-                "created",
-                "updated",
-                "dob",
-                "birth",
-            }
-        ),
-    ),
-    (
-        "organization",
-        frozenset(
-            {
-                "company",
-                "vendor",
-                "supplier",
-                "department",
-                "merchant",
-                "employer",
-                "org",
-                "company_name",
-            }
-        ),
-    ),
-    (
-        "person_name",
-        frozenset(
-            {
-                "name",
-                "person",
-                "customer",
-                "client",
-                "buyer",
-                "employee",
-                "member",
-                "contact",
-                "full_name",
-                "first_name",
-                "last_name",
-            }
-        ),
-    ),
-    (
-        "location",
-        frozenset(
-            {
-                "city",
-                "town",
-                "address",
-                "region",
-                "zip",
-                "postal",
-                "state",
-                "country",
-                "location",
-            }
-        ),
-    ),
-    (
-        "salary_comp",
-        frozenset(
-            {
-                "salary",
-                "wage",
-                "payroll",
-                "compensation",
-                "base_salary",
-                "annual_salary",
-                "hourly",
-                "bonus",
-                "stipend",
-            }
-        ),
-    ),
-    (
-        "amount_monetary",
-        frozenset(
-            {
-                "amount",
-                "price",
-                "total",
-                "cost",
-                "subtotal",
-                "tax",
-                "fee",
-                "balance",
-                "net",
-                "gross",
-                "grand_total",
-                "line_total",
-                "revenue",
-                "paid",
-                "due",
-                "value",
-            }
-        ),
-    ),
-    (
-        "payment_method",
-        frozenset(
-            {
-                "payment_method",
-                "payment_mode",
-                "payment_type",
-                "method",
-                "card_type",
-                "cash",
-                "upi",
-                "wallet",
-                "bank_transfer",
-            }
-        ),
-    ),
-    ("currency", frozenset({"currency", "curr", "iso", "fx"})),
-)
-
-
-def _header_matches_keywords(norm_header: str, keywords: frozenset[str]) -> bool:
-    if not norm_header:
-        return False
-    for kw in keywords:
-        if len(kw) <= 2 and norm_header != kw:
-            continue
-        if norm_header == kw:
-            return True
-        if len(kw) >= 3 and kw in norm_header:
-            return True
-        if norm_header.startswith(kw + "_") or norm_header.endswith("_" + kw):
-            return True
-    return False
-
 
 def _is_valid_source_column_name(col: str) -> bool:
     nk = normalize_field_name(str(col))
@@ -189,72 +40,76 @@ def _is_valid_source_column_name(col: str) -> bool:
     return not any(frag in nk for frag in _INVALID_SOURCE_KEY_FRAGMENTS)
 
 
-def classify_fields(columns: list[str]) -> dict[str, list[str]]:
+def classify_fields(columns: list[str], sample_rows: list[dict[str, Any]] | None = None) -> dict[str, list[str]]:
     """
-    Map semantic roles → list of original column names (each column assigned once).
-    quantity and salary_comp are never merged with amount_monetary.
+    Map semantic roles → list of original column names.
+
+    When sample_rows are provided, classification uses VALUE PATTERNS.
+    When not provided, uses lightweight value-agnostic heuristics.
+    Each column assigned at most once.
     """
     field_map: dict[str, list[str]] = {}
     used: set[str] = set()
 
-    for col in columns:
-        if col is None or not str(col).strip():
-            continue
-        orig = str(col).strip()
-        if orig in used:
-            continue
-        if not _is_valid_source_column_name(orig):
-            continue
-        nk = normalize_field_name(orig)
-        if not nk:
-            continue
-        assigned = False
-        for role, kws in _ROLE_SPECS:
-            if _header_matches_keywords(nk, kws):
+    if sample_rows:
+        # Profile-driven classification from actual values
+        for col in columns:
+            if col is None or not str(col).strip():
+                continue
+            orig = str(col).strip()
+            if orig in used:
+                continue
+            if not _is_valid_source_column_name(orig):
+                continue
+
+            values = [r.get(orig) for r in sample_rows]
+            cp = profile_column(orig, values)
+
+            role = _type_to_role(cp.inferred_type)
+            if role:
                 field_map.setdefault(role, []).append(orig)
                 used.add(orig)
-                assigned = True
-                break
-        if not assigned:
-            logger.debug("Skipped invalid field mapping | column=%r (no semantic role)", orig)
+            else:
+                logger.debug("No semantic role for column=%r (type=%s)", orig, cp.inferred_type)
+    else:
+        # Lightweight heuristic without data (preserves backward compat)
+        for col in columns:
+            if col is None or not str(col).strip():
+                continue
+            orig = str(col).strip()
+            if orig in used:
+                continue
+            if not _is_valid_source_column_name(orig):
+                continue
+            used.add(orig)
+            # Without data, all columns go unmapped
+            logger.debug("Skipped column=%r (no sample data for profiling)", orig)
 
     nonempty = {k: v for k, v in field_map.items() if v}
-    logger.info("Using semantic mapping for fields: %s", list(nonempty.keys()))
+    if nonempty:
+        logger.info("Using semantic mapping for fields: %s", list(nonempty.keys()))
 
     unmapped = [str(c).strip() for c in columns if c and str(c).strip() and str(c).strip() not in used]
     if unmapped:
-        logger.info(
-            "Skipped invalid field mapping | unmapped_columns=%s",
-            unmapped[:20],
-        )
+        logger.info("Unmapped columns: %s", unmapped[:20])
 
     return field_map
 
 
-def _sort_amount_columns(cols: list[str]) -> list[str]:
-    """Prefer totals / line amounts over unit price when several money columns exist."""
-
-    def sort_key(c: str) -> tuple[int, str]:
-        n = normalize_field_name(str(c))
-        if "grand" in n or n == "total" or n.endswith("_total") or "total_amount" in n:
-            return (0, c)
-        if "line" in n and "total" in n:
-            return (1, c)
-        if "subtotal" in n:
-            return (2, c)
-        if "net" in n or "gross" in n:
-            return (3, c)
-        if "tax" in n or "fee" in n or "discount" in n:
-            return (4, c)
-        if "balance" in n or "due" in n or "paid" in n:
-            return (5, c)
-        if "unit" in n and "price" in n:
-            return (8, c)
-        if "price" in n or "rate" in n or "cost" in n:
-            return (7, c)
-        return (6, c)
-
-    return sorted(cols, key=sort_key)
+def _type_to_role(inferred_type: str) -> str | None:
+    """Map profiler inferred types to semantic roles."""
+    mapping = {
+        "email": "email",
+        "phone": "phone",
+        "date": "date",
+        "monetary": "amount_monetary",
+        "numeric": "amount_monetary",  # numeric could be monetary — context decides
+        "identifier": "identifier",
+        "text": None,  # text doesn't map to a specific role
+        "categorical": None,
+        "boolean": None,
+    }
+    return mapping.get(inferred_type)
 
 
 def dynamic_semantic_map(row: dict[str, Any], field_map: dict[str, Any]) -> dict[str, Any]:
@@ -265,8 +120,6 @@ def dynamic_semantic_map(row: dict[str, Any], field_map: dict[str, Any]) -> dict
             continue
         col_list = cols if isinstance(cols, list) else [cols]
         col_list = list(col_list)
-        if role == "amount_monetary":
-            col_list = _sort_amount_columns(col_list)
         for c in col_list:
             if not _is_valid_source_column_name(str(c)):
                 continue
@@ -277,27 +130,12 @@ def dynamic_semantic_map(row: dict[str, Any], field_map: dict[str, Any]) -> dict
                 continue
             if isinstance(v, str) and not v.strip():
                 continue
-            # Guard against semantic confusion: monetary roles must hold numeric-like values.
+            # Guard: monetary roles must hold numeric-like values
             if role in ("amount_monetary", "salary_comp") and amount_from_value(v) is None:
                 continue
             out[role] = v
             break
     return out
-
-
-def _ai_role_aliases() -> dict[str, str]:
-    """Map AI / legacy schema keys onto internal roles."""
-    return {
-        "amount": "amount_monetary",
-        "person_name": "person_name",
-        "organization": "organization",
-        "date": "date",
-        "currency": "currency",
-        "email": "email",
-        "phone": "phone",
-        "city": "location",
-        "quantity": "quantity",
-    }
 
 
 def merge_field_maps(
@@ -306,13 +144,12 @@ def merge_field_maps(
     *,
     valid_columns: set[str] | None = None,
 ) -> dict[str, list[str]]:
-    """Union column lists per role; AI keys are aliased to internal roles."""
+    """Union column lists per role."""
     out: dict[str, list[str]] = {k: list(v) for k, v in base.items()}
     if not overlay:
         return out
-    aliases = _ai_role_aliases()
     for key, cols in overlay.items():
-        role = aliases.get(str(key), str(key))
+        role = str(key)
         if role not in out:
             out[role] = []
         seq = cols if isinstance(cols, list) else [cols]
