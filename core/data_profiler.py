@@ -164,7 +164,12 @@ def _looks_like_currency_value(v: str) -> bool:
 
 
 def _coerce_number(v: Any) -> float | None:
-    """Attempt to parse a value as a number."""
+    """
+    Attempt to parse a value as a number.
+
+    Non-destructive: cleans noise (brackets, citations) before parsing
+    so "7[2]" → 7, "100†" → 100, "1,500[a]" → 1500.
+    """
     if v is None:
         return None
     if isinstance(v, bool):
@@ -179,9 +184,16 @@ def _coerce_number(v: Any) -> float | None:
             return None
         if "@" in s:  # Don't try to parse emails as numbers
             return None
+        # Try direct parse first
         n = amount_from_value(s)
         if n is not None:
             return float(n)
+        # Clean noise and retry: "7[2]" → "7", "100†" → "100"
+        cleaned = clean_text_noise(s)
+        if cleaned and cleaned != s:
+            n2 = amount_from_value(cleaned)
+            if n2 is not None:
+                return float(n2)
     return None
 
 

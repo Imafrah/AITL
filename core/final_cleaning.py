@@ -196,17 +196,28 @@ def _dedupe_by_keys(
     return deduped, len(records) - len(deduped)
 
 
-def _safe_default_for_type(inferred_type: str) -> Any:
-    """Return a safe default value based on inferred column type."""
+def _safe_default_for_type(inferred_type: str, *, dataset_type: str = "entity") -> Any:
+    """
+    Return a safe default value based on inferred column type.
+
+    NON-DESTRUCTIVE PRINCIPLE:
+    - Analytical datasets: ALWAYS return None (never fabricate values)
+    - Entity/transactional: minimal safe defaults only when caller opts in
+    """
+    # Analytical data: NEVER fabricate values
+    if dataset_type == "analytical":
+        return None
+
     if inferred_type in ("boolean",):
         return False
     if inferred_type in ("numeric", "monetary"):
-        return 0
+        return None  # Do NOT replace missing numbers with 0
     if inferred_type in ("phone", "email", "identifier"):
-        return ""  # Do NOT fill structured types with 'unknown'
+        return None  # Do NOT fill structured types
     if inferred_type in ("date",):
-        return "unknown"
-    return "unknown"
+        return None  # Do NOT fabricate dates
+    # Text: only fill if explicitly opted in via text_missing_placeholder
+    return None
 
 
 def _schema_key_order(all_keys: Iterable[str], *, include_imputed_slot: bool) -> list[str]:
@@ -563,7 +574,7 @@ def run_final_cleaning_layer(
                         im[k] = "median"
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # PASS 4: Row quality filtering (mode-aware)
+    # PASS 4: Row quality filtering (mode-aware, NON-DESTRUCTIVE)
     # ═══════════════════════════════════════════════════════════════════════════
 
     before_filter = len(working)
@@ -572,7 +583,11 @@ def run_final_cleaning_layer(
     critical_fields = profile.critical_columns
     stats["critical_fields_detected"] = critical_fields
 
-    if cfg.clean_mode == "strict":
+    # ANALYTICAL datasets: NEVER drop rows (preserve all data points)
+    if dataset_type == "analytical":
+        logger.info("Analytical dataset — row filtering SKIPPED (non-destructive)")
+        kept = list(working)
+    elif cfg.clean_mode == "strict":
         logger.info("Strict mode | critical fields: %s", critical_fields)
         for r in working:
             # General missing-ratio filter
@@ -606,7 +621,17 @@ def run_final_cleaning_layer(
             kept.append(r)
     else:
         # SAFE mode: only remove rows when 2+ critical fields are missing
+        # and row is truly corrupted (not just partially incomplete)
         for r in working:
+            # Check if row has ANY meaningful data
+            content_vals = [
+                r.get(k) for k in schema_keys
+                if _is_present(r.get(k))
+            ]
+            if not content_vals:
+                # Completely empty row — safe to drop
+                continue
+
             missing_critical_n = sum(1 for cf in critical_fields if not _is_present(r.get(cf)))
             if missing_critical_n >= 2:
                 continue
@@ -712,27 +737,26 @@ def run_final_cleaning_layer(
                     r[bk] = bval
 
         # Mode-aware critical filtering in final shaping (strict only)
-        # SAFE mode filtering already done in PASS 4 — don't re-filter here
-        if cfg.clean_mode == "strict":
+        # SAFE mode filtering already done in PASS 4
+        # ANALYTICAL datasets: NEVER drop rows in final shaping
+        if cfg.clean_mode == "strict" and dataset_type != "analytical":
             final_critical = final_profile.critical_columns if final_profile.columns else critical_fields
             missing_crit_n = sum(1 for cf in final_critical if not _is_present(r.get(cf)))
             if missing_crit_n >= 1:
                 dropped_for_critical += 1
                 continue
 
-        # Fill remaining nulls with safe type-appropriate defaults
-        for k in final_content_keys:
-            if not _is_present(r.get(k)):
-                cp = final_profile.columns.get(k) or profile.columns.get(k)
-                ctype = cp.inferred_type if cp else "text"
-                r[k] = _safe_default_for_type(ctype)
-
-        # Final hard guarantee: no residual None
-        for k in list(r.keys()):
-            if r.get(k) is None:
-                cp = final_profile.columns.get(k) or profile.columns.get(k)
-                ctype = cp.inferred_type if cp else "text"
-                r[k] = _safe_default_for_type(ctype)
+        # NON-DESTRUCTIVE null handling:
+        # - Analytical: NEVER fill nulls (preserve original data)
+        # - Entity/Transactional: fill only when non-destructive
+        if dataset_type != "analytical":
+            for k in final_content_keys:
+                if not _is_present(r.get(k)):
+                    cp = final_profile.columns.get(k) or profile.columns.get(k)
+                    ctype = cp.inferred_type if cp else "text"
+                    default = _safe_default_for_type(ctype, dataset_type=dataset_type)
+                    if default is not None:
+                        r[k] = default
 
         shaped.append(r)
 
