@@ -106,6 +106,9 @@ class ColumnProfile:
     value_pattern: str | None = None
     sample_values: list[Any] = field(default_factory=list)
     statistics: dict[str, Any] = field(default_factory=dict)
+    # Semantic confidence flag — False means the type assignment is uncertain.
+    # Downstream consumers MUST respect this and fall back to generic handling.
+    semantic_confidence_high: bool = True
 
 
 @dataclass
@@ -142,9 +145,22 @@ def _looks_like_date(v: str) -> bool:
     s = v.strip()
     if len(s) < 4 or len(s) > 40:
         return False
+    # SAFETY: bare numeric strings (e.g. "7", "10", "42") are NOT dates.
+    # A 4-digit all-numeric string could be a year ("2020") — allow those through,
+    # but reject anything shorter that is purely digits (ranks, indices, counts).
+    if s.isdigit() and len(s) < 4:
+        return False
+    # Reject values that are purely numeric with no date separator — e.g. "20201301"
+    # Only 8-digit strings matching YYYYMMDD are allowed through the full parse.
+    if s.isdigit() and len(s) not in (4, 8):
+        return False
     # Quick pattern match first
     for pat in _DATE_PATTERNS:
         if pat.match(s):
+            # Extra guard: a 4-digit match (e.g. "2020") is a year, not a full date
+            # — allow it only via the full date parser that rejects bare years.
+            if s.isdigit() and len(s) == 4:
+                return is_valid_date(s)
             return True
     # Full parse fallback
     return is_valid_date(s)
@@ -282,18 +298,33 @@ def profile_column(name: str, values: list[Any]) -> ColumnProfile:
         prof.allows_imputation = True
         return prof
 
-    # Date: 50%+ values parse as dates AND column is not purely numeric
+    # Date: 60%+ values parse as dates AND column is not purely numeric
     # (avoid classifying year columns like 2020, 2021 as dates)
     num_ratio = num_hits / filled if filled else 0
-    if filled >= 1 and date_hits / filled >= 0.50 and num_ratio < 0.50:
+    if filled >= 2 and date_hits / filled >= 0.60 and num_ratio < 0.50:
         prof.inferred_type = "date"
         prof.allows_imputation = False
         return prof
 
+    # ── RANK / INDEX GUARD (Rule #4: small integers 1–100 are NOT money) ────────
+    # Before any numeric classification, check if this looks like a rank/index column.
+    # Criteria: 80%+ of numeric values are integers in [1, 100] with reasonable uniqueness.
+    if num_hits >= 2 and num_ratio >= 0.55:
+        if _is_rank_or_index_column(num_values, filled):
+            # Rank/index columns: treat as identifier, not numeric/monetary.
+            # Low semantic confidence — do not force a label.
+            prof.inferred_type = "identifier"
+            prof.is_candidate_key = False  # rank is not a unique key in general
+            prof.allows_imputation = False
+            prof.semantic_confidence_high = False  # signal: uncertain, treat generically
+            _add_numeric_stats(prof, num_values)
+            return prof
+
     # Numeric: 55%+ values parse as numbers (checked BEFORE monetary)
     if filled >= 1 and num_ratio >= 0.55:
-        # Check if it's actually monetary (has currency symbols/formatting)
-        if currency_hits / filled >= 0.40:
+        # Check if it's actually monetary (has currency symbols/formatting).
+        # Raised threshold to 0.60 for higher confidence before labeling "monetary".
+        if currency_hits / filled >= 0.60:
             prof.inferred_type = "monetary"
             prof.allows_imputation = False
             _add_numeric_stats(prof, num_values)
@@ -330,6 +361,62 @@ def profile_column(name: str, values: list[Any]) -> ColumnProfile:
             prof.allows_imputation = False
 
     return prof
+
+
+def _is_rank_or_index_column(num_values: list[float], filled: int) -> bool:
+    """
+    Return True if the numeric values look like a rank or index column.
+
+    Criteria (ALL must hold):
+    - 80%+ of values are integers (no fractional part)
+    - 80%+ of values fall within [1, 100]
+    - The MINIMUM value is ≤ 10 (real ranks start near 1, e.g., 1st, 2nd, 3rd)
+    - The value SPREAD (max - min) is ≤ 30 (ranks span a narrow sequential range)
+    - The column has some variation (values not all the same)
+
+    Why the min/spread guards?
+    Score columns like [80, 82, 85, 90] are NOT ranks even though they are
+    integers in [1, 100]. Their minimum (~80) and spread (~10) distinguish
+    them from true rank columns like [1, 2, 3, 4] or [3, 7, 1, 5].
+
+    This prevents score/percentage/grade columns from being labeled as rank/index
+    while still catching true positional columns.
+    """
+    if not num_values or filled < 2:
+        return False
+
+    int_vals = [int(v) for v in num_values if v == int(v)]
+    integer_ratio = len(int_vals) / len(num_values)
+
+    # Must be mostly integers
+    if integer_ratio < 0.80:
+        return False
+
+    # Must fall within [1, 100]
+    small_int_hits = sum(1 for v in int_vals if 1 <= v <= 100)
+    small_int_ratio = small_int_hits / len(num_values)
+    if small_int_ratio < 0.80:
+        return False
+
+    # CRITICAL: real ranks START near 1 — min value must be ≤ 10.
+    # Scores like [80, 82, 85] have min=80 → NOT a rank column.
+    min_val = min(int_vals)
+    if min_val > 10:
+        return False
+
+    # CRITICAL: ranks span a NARROW sequential range — spread must be ≤ 30.
+    # This catches true ranking columns (1-10, 2-15) and excludes score/percentage
+    # columns that happen to use small integers in a mid-range (e.g. 40-70).
+    max_val = max(int_vals)
+    if (max_val - min_val) > 30:
+        return False
+
+    # Must have some variation (not all the same value)
+    distinct_count = len(set(int_vals))
+    if distinct_count < 2:
+        return False
+
+    return True
 
 
 def _add_numeric_stats(prof: ColumnProfile, values: list[float]) -> None:

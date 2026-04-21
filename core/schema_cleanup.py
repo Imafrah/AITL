@@ -3,6 +3,10 @@ Dataset-agnostic schema normalization: pruning, numeric coercion,
 critical-field inference, adaptive confidence, and cleanup logging.
 
 All logic driven by value patterns and DatasetProfile — no hardcoded column names.
+
+Safety Rule: Do NOT coerce bare small integer strings (e.g. "7", "10") to floats.
+These are likely rank, index, or count values — not monetary amounts.
+Only coerce when the value clearly has monetary formatting or is a large number.
 """
 
 from __future__ import annotations
@@ -26,6 +30,33 @@ _RESERVED_KEYS = frozenset(
     }
 )
 
+# Bare small integer: a string that is purely a small number (1–100) with no
+# currency symbol, comma-formatting, or decimal. These are rank/index values,
+# NOT monetary amounts — do not coerce them to float.
+_BARE_SMALL_INT_RE = re.compile(r"^\d{1,3}$")
+_CURRENCY_SYMBOL_IN_VALUE_RE = re.compile(r"[$€£₹¥₩₽]")
+
+
+def _is_bare_small_integer_string(v: str) -> bool:
+    """
+    Return True if the string value looks like a bare small integer (1–999)
+    with no currency symbol or comma-formatting.
+
+    These are rank/index/count values and must NOT be coerced to float
+    by schema_cleanup — the profiler decides their type from column context.
+    """
+    s = v.strip()
+    if not _BARE_SMALL_INT_RE.match(s):
+        return False
+    # Extra safety: no currency symbols anywhere
+    if _CURRENCY_SYMBOL_IN_VALUE_RE.search(s):
+        return False
+    try:
+        n = int(s)
+        return 0 <= n <= 999
+    except ValueError:
+        return False
+
 
 def clean_schema(record: dict[str, Any], semantic_map: dict[str, Any] | None) -> tuple[dict[str, Any], bool]:
     """
@@ -33,6 +64,12 @@ def clean_schema(record: dict[str, Any], semantic_map: dict[str, Any] | None) ->
 
     No fixed field promotions (person_name↔full_name, salary→amount, etc.).
     All field relationships are preserved as-is from the source data.
+
+    Coercion Safety Rule:
+    - Do NOT coerce bare small integers ("7", "10", "99") to float.
+      These are likely ranks or indices, not monetary amounts.
+    - Only coerce strings that clearly have monetary formatting (currency symbol,
+      comma-formatted large numbers) or are unambiguously large numeric values.
     """
     semantic_map = semantic_map or {}
     out = dict(record)
@@ -56,18 +93,28 @@ def clean_schema(record: dict[str, Any], semantic_map: dict[str, Any] | None) ->
     if empty_removed:
         logger.debug("Pruned empty fields: %s", empty_removed[:15])
 
-    # Generic numeric coercion for string values that look purely numeric
+    # Selective numeric coercion for string values that look clearly numeric.
+    # SAFETY: skip bare small integers — they are likely ranks/indices, not money.
     for k in list(out.keys()):
         if k in _RESERVED_KEYS:
             continue
         v = out[k]
         if isinstance(v, str) and v.strip():
-            if re.fullmatch(r"[\s$€£₹-]*\d[\d,.\s$€£₹%-]*", v.strip()):
-                parsed = amount_from_value(v)
+            s = v.strip()
+            if re.fullmatch(r"[\s$€£₹-]*\d[\d,.\s$€£₹%-]*", s):
+                # RULE: If this is a bare small integer, do NOT coerce.
+                # Let the column-level profiler decide the type from context.
+                if _is_bare_small_integer_string(s):
+                    logger.debug(
+                        "Coercion skipped for bare small integer string=%r in field=%r",
+                        s, k,
+                    )
+                    continue
+                parsed = amount_from_value(s)
                 if parsed is not None:
                     out[k] = parsed
                     had_norm = True
-                elif not any(c.isalpha() for c in v if c.lower() not in "e"):
+                elif not any(c.isalpha() for c in s if c.lower() not in "e"):
                     out[k] = None
                     had_norm = True
 

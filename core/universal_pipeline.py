@@ -518,7 +518,18 @@ def process_universal(
     if any_conf_adj:
         logger.info("Confidence adjusted dynamically")
 
-    analytics = compute_analytics(data)
+    # Pass only confirmed monetary columns to analytics so rank/index columns
+    # are not included in aggregate statistics (Analytics Safety Rule #5).
+    confirmed_monetary: set[str] = set()
+    if profile:
+        confirmed_monetary = {
+            name for name, cp in profile.columns.items()
+            if cp.inferred_type == "monetary" and cp.semantic_confidence_high
+        }
+    analytics = compute_analytics(
+        data,
+        confirmed_numeric_cols=confirmed_monetary if confirmed_monetary else None,
+    )
     validation_summary = _build_validation_summary(data)
 
     if not data:

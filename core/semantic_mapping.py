@@ -65,7 +65,7 @@ def classify_fields(columns: list[str], sample_rows: list[dict[str, Any]] | None
             values = [r.get(orig) for r in sample_rows]
             cp = profile_column(orig, values)
 
-            role = _type_to_role(cp.inferred_type)
+            role = _type_to_role(cp.inferred_type, semantic_confidence_high=cp.semantic_confidence_high)
             if role:
                 field_map.setdefault(role, []).append(orig)
                 used.add(orig)
@@ -96,18 +96,33 @@ def classify_fields(columns: list[str], sample_rows: list[dict[str, Any]] | None
     return field_map
 
 
-def _type_to_role(inferred_type: str) -> str | None:
-    """Map profiler inferred types to semantic roles."""
+def _type_to_role(inferred_type: str, *, semantic_confidence_high: bool = True) -> str | None:
+    """
+    Map profiler inferred types to semantic roles.
+
+    SAFETY RULE: Only assign a semantic role when confidence is HIGH.
+    - "monetary" → "amount_monetary" (requires confirmed currency symbol evidence)
+    - "numeric" → None  (generic number; could be rank, score, count — do NOT force money label)
+    - Identifier-typed columns with low confidence (rank/index) → None
+    """
+    if not semantic_confidence_high:
+        # Low confidence: keep generic, do not assign a potentially wrong role
+        return None
+
     mapping = {
         "email": "email",
         "phone": "phone",
         "date": "date",
         "monetary": "amount_monetary",
-        "numeric": "amount_monetary",  # numeric could be monetary — context decides
-        "identifier": "identifier",
-        "text": None,  # text doesn't map to a specific role
+        # "numeric" is intentionally NOT mapped to "amount_monetary".
+        # A numeric column with no currency evidence is likely a rank, score, count,
+        # quantity, or index — not money. Assigning "amount_monetary" would be WRONG.
+        # Rule: be generic but correct, not specific but wrong.
+        "text": None,
         "categorical": None,
         "boolean": None,
+        "identifier": None,
+        "numeric": None,
     }
     return mapping.get(inferred_type)
 
