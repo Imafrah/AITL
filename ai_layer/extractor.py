@@ -177,6 +177,117 @@ DOCUMENT:
 {text}
 """,
 
+    "tabular": """
+You are a data cleaning engine inside AITL (AI Data Translation Layer).
+Your job is to clean tabular datasets and return structured JSON.
+
+STEP 1 — READ THE FULL DATASET FIRST
+Before making any decision, read every column name and every value
+together as a whole. Understand what real-world subject this dataset
+describes. Use that understanding for every decision below.
+
+STEP 2 — CLASSIFY DATASET TYPE
+Based on your understanding from Step 1, classify as one of:
+- analytical  : rankings, leaderboards, statistics, financial summaries,
+                performance metrics, reports
+- transactional: purchases, events, logs, individual transactions
+- entity      : people, products, places with descriptive attributes
+
+Lock this classification. Never override it later.
+
+STEP 3 — CLASSIFY EACH COLUMN
+For every column, infer its semantic type using ONLY:
+- the column name
+- what the column means in the context of this specific dataset
+- the pattern of values across the entire column
+
+Allowed column types: monetary, numeric, text, date, identifier, boolean
+
+Rules:
+- Use column name as the primary signal
+- Use the dataset subject to resolve ambiguity
+- Any column that semantically means money, revenue, earnings, gross,
+  cost, salary, price, or amount → classify as monetary
+- Never classify a column as phone unless its name or values
+  explicitly represent a telephone contact number
+- Never classify a column as email unless it represents an email address
+- Do not use digit count or value magnitude to decide type
+
+STEP 4 — CLEAN EACH VALUE BASED ON ITS COLUMN TYPE
+
+monetary:
+  - Strip: currency symbols, commas, spaces
+  - Strip: citation markers like [1] [2] [a] [b]
+  - Strip: footnote symbols like † ‡ * and trailing letters in brackets
+  - Return as: integer or float — NEVER as a string
+  - The returned number must be numerically identical to the original
+  - Only formatting characters are removed, the number itself is untouched
+
+numeric:
+  - Strip: citation markers, footnote symbols, non-numeric characters
+  - Return as: integer or float
+  - Preserve original magnitude exactly
+
+text:
+  - Strip: citation markers like [1] [a], footnote symbols † ‡ *
+  - Trim whitespace
+  - Preserve everything else exactly
+
+identifier:
+  - Strip: citation markers like [1] [a], footnote symbols † ‡ *
+  - Trim whitespace
+  - Preserve the rest exactly as-is
+
+date:
+  - Normalize to YYYY-MM-DD only if value is clearly a date
+  - If ambiguous, treat as identifier
+
+boolean:
+  - Normalize yes/no, Y/N, 1/0, T/F → true/false only
+
+STEP 5 — ROW DELETION POLICY
+Delete a row ONLY IF every field that carries meaning for this
+dataset's purpose is missing, null, or completely unreadable.
+
+Never delete rows for:
+- missing optional fields
+- partial nulls
+- low confidence scores
+- anomaly flags
+- citation-only fields that become null after cleaning
+
+STEP 6 — NULL RATE RULE
+Never convert a non-null value into null unless the only content
+in that field was noise (citations, symbols) and nothing remains.
+Null rate after cleaning must be equal to or less than before cleaning.
+
+STEP 7 — OUTPUT FORMAT
+Return a JSON object with this exact structure:
+{
+  "dataset_type": "<analytical|transactional|entity>",
+  "field_types": {
+    "<column_name>": "<type>",
+    ...
+  },
+  "cleaned_data": [
+    { ...all original fields with cleaned values and correct types... },
+    ...
+  ]
+}
+
+Rules for output:
+- Include ALL rows that have at least one meaningful field
+- monetary and numeric values must be integer or float, never string
+- Preserve original field names exactly
+- Do not add new fields
+- Do not invent, impute, or guess any values
+- Do not include pipeline-internal flags like is_anomaly, confidence,
+  is_valid_email, is_valid_date in cleaned_data
+
+DATASET:
+{text}
+""",
+
     "unknown": """
 You are a precise data extraction engine.
 Extract whatever structured information you can find:
@@ -222,6 +333,45 @@ def extract_entities(text: str, api_key: str, document_type: str = "unknown") ->
 
     prompt_template = PROMPTS.get(document_type, PROMPTS["unknown"])
     prompt = prompt_template.format(text=text)
+
+    # Tabular cleaning returns free-form JSON, not the DocumentExtraction schema
+    if document_type == "tabular":
+        backoffs = (1, 2, 4)
+        max_retries = 3
+        last_error = None
+        response = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                    ),
+                )
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries and _is_retryable_transport_error(e):
+                    wait_s = backoffs[attempt]
+                    logger.warning("Retrying tabular AI call (attempt %s)... after %ss | %s", attempt + 1, wait_s, e)
+                    time.sleep(wait_s)
+                    continue
+                raise AIServiceError(f"AI service failed: {e}") from e
+
+        if response is None and last_error is not None:
+            raise AIServiceError(f"AI service failed after retries: {last_error}") from last_error
+
+        raw = getattr(response, "text", None) or ""
+        if not str(raw).strip():
+            raise AIServiceError("Empty response from AI model.")
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise AIServiceError(f"Invalid JSON from AI:\n{raw[:300]}") from e
 
     schema_dict = DocumentExtraction.model_json_schema()
     clean_schema = remove_additional_properties(schema_dict)
