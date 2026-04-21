@@ -1,10 +1,15 @@
 """
-Dynamic Data Profiler — schema-agnostic column classification and dataset understanding.
+Dynamic Data Profiler — column classification and dataset understanding.
 
-All decisions derived from value patterns, distributions, and statistical properties.
-NO hardcoded column names. NO fixed schemas.
+Classification uses value patterns, distributions, and statistical properties
+AND column-name context when available (e.g. column named 'revenue' → monetary).
 
-Paradigm: Observe → Infer → Decide → Clean
+Column-name context provides INTENT hints that resolve ambiguity:
+  - If a column name suggests monetary meaning, treat it as monetary regardless of
+    value size (do not classify based on digit count or value magnitude alone).
+  - If column names suggest analytical/ranking data, lock dataset type accordingly.
+
+Paradigm: Observe → Infer (values + name context) → Decide → Clean
 """
 
 from __future__ import annotations
@@ -56,7 +61,7 @@ _PIPELINE_ARTIFACT_KEYS = frozenset(
     }
 )
 
-# ── Pattern regexes (value-based, not column-name-based) ─────────────────────
+# ── Pattern regexes ──────────────────────────────────────────────────────────
 
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 _PHONE_DIGITS_RE = re.compile(r"\D+")
@@ -73,6 +78,45 @@ _DATE_PATTERNS = [
     re.compile(r"^\d{1,2}\s+\w+\s+\d{4}$"),                 # 15 March 2024
     re.compile(r"^\w+\s+\d{1,2},?\s+\d{4}$"),               # March 15, 2024
 ]
+
+# ── Column-name keyword hints ────────────────────────────────────────────────
+# These resolve ambiguity when value patterns alone are inconclusive.
+# If a column name contains one of these tokens, it provides INTENT context.
+
+_MONETARY_NAME_KEYWORDS = frozenset({
+    "revenue", "earnings", "gross", "salary", "cost", "price", "amount",
+    "net", "income", "profit", "expense", "fee", "wage", "budget", "total",
+    "compensation", "payment", "balance", "spend", "turnover", "margin",
+    "receipt", "invoice", "billing", "charge", "premium", "valuation",
+})
+
+_ANALYTICAL_NAME_KEYWORDS = frozenset({
+    "rank", "ranking", "index", "score", "rating", "metric", "percentile",
+    "statistic", "statistics", "average", "median", "benchmark", "kpi",
+    "leaderboard", "standings", "position",
+})
+
+# Regex to split column names into tokens for whole-word matching.
+# Splits on underscores, spaces, hyphens, camelCase boundaries.
+_TOKEN_SPLIT_RE = re.compile(r"[_\s\-]+|(?<=[a-z])(?=[A-Z])")
+
+
+def _name_tokens(name: str) -> set[str]:
+    """Split a column name into lowercase tokens for whole-word matching."""
+    normalized = normalize_field_name(str(name)).lower()
+    return {t for t in _TOKEN_SPLIT_RE.split(normalized) if t}
+
+
+def _column_name_suggests_monetary(name: str) -> bool:
+    """True if the column name contains a whole-word token implying monetary meaning."""
+    tokens = _name_tokens(name)
+    return bool(tokens & _MONETARY_NAME_KEYWORDS)
+
+
+def _column_name_suggests_analytical(name: str) -> bool:
+    """True if the column name contains a whole-word token implying analytical/rankings data."""
+    tokens = _name_tokens(name)
+    return bool(tokens & _ANALYTICAL_NAME_KEYWORDS)
 
 
 def _is_present(v: Any) -> bool:
@@ -232,13 +276,18 @@ def _coerce_bool(value: Any) -> bool | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Column Profiling — classify columns from VALUE PATTERNS only
+# Column Profiling — classify from value patterns + column name context
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def profile_column(name: str, values: list[Any]) -> ColumnProfile:
     """
-    Profile a single column from its values. No column-name heuristics.
-    Classification is purely by value pattern analysis.
+    Profile a single column from its values AND column name context.
+
+    Column-name context resolves ambiguity:
+    - If the name suggests monetary intent (salary, revenue, cost, etc.),
+      the column is classified as 'monetary' regardless of value magnitude.
+    - Value-pattern analysis is the primary signal; name hints override
+      only when values are numeric but the type is ambiguous.
     """
     prof = ColumnProfile(name=name)
     total = len(values)
@@ -306,24 +355,35 @@ def profile_column(name: str, values: list[Any]) -> ColumnProfile:
         prof.allows_imputation = False
         return prof
 
-    # ── RANK / INDEX GUARD (Rule #4: small integers 1–100 are NOT money) ────────
-    # Before any numeric classification, check if this looks like a rank/index column.
-    # Criteria: 80%+ of numeric values are integers in [1, 100] with reasonable uniqueness.
-    if num_hits >= 2 and num_ratio >= 0.55:
+    # ── Column-name monetary override ─────────────────────────────────────────
+    # TYPE CLASSIFICATION RULE: If a column name suggests revenue, earnings,
+    # salary, cost, price, or amount — treat it as monetary regardless of
+    # value size. Do not classify based on digit count or value magnitude alone.
+    name_is_monetary = _column_name_suggests_monetary(name)
+
+    # ── RANK / INDEX GUARD ───────────────────────────────────────────────────
+    # Small integers 1–100 are NOT money — UNLESS column name says otherwise.
+    if num_hits >= 2 and num_ratio >= 0.55 and not name_is_monetary:
         if _is_rank_or_index_column(num_values, filled):
-            # Rank/index columns: treat as identifier, not numeric/monetary.
-            # Low semantic confidence — do not force a label.
             prof.inferred_type = "identifier"
-            prof.is_candidate_key = False  # rank is not a unique key in general
+            prof.is_candidate_key = False
             prof.allows_imputation = False
-            prof.semantic_confidence_high = False  # signal: uncertain, treat generically
+            prof.semantic_confidence_high = False
             _add_numeric_stats(prof, num_values)
             return prof
 
-    # Numeric: 55%+ values parse as numbers (checked BEFORE monetary)
+    # Numeric: 55%+ values parse as numbers
     if filled >= 1 and num_ratio >= 0.55:
-        # Check if it's actually monetary (has currency symbols/formatting).
-        # Raised threshold to 0.60 for higher confidence before labeling "monetary".
+        # Column name says monetary → classify as monetary (high confidence)
+        if name_is_monetary:
+            prof.inferred_type = "monetary"
+            prof.semantic_confidence_high = True
+            prof.allows_imputation = False
+            _add_numeric_stats(prof, num_values)
+            if num_values and len(num_values) >= 3:
+                _decide_numeric_imputation(prof, num_values, filled)
+            return prof
+        # Value evidence: currency symbols/formatting
         if currency_hits / filled >= 0.60:
             prof.inferred_type = "monetary"
             prof.allows_imputation = False
@@ -333,7 +393,6 @@ def profile_column(name: str, values: list[Any]) -> ColumnProfile:
             return prof
         prof.inferred_type = "numeric"
         _add_numeric_stats(prof, num_values)
-        # Imputation decision: based on variance and uniqueness
         if num_values and len(num_values) >= 3:
             _decide_numeric_imputation(prof, num_values, filled)
         return prof
@@ -591,11 +650,16 @@ def _infer_dedup_keys(profile: DatasetProfile) -> list[str]:
 def _classify_dataset_type(profile: DatasetProfile) -> str:
     """
     Classify dataset as entity | transactional | analytical using
-    column relationships and statistical properties — NOT keywords.
+    column names, column relationships, and statistical properties.
+
+    DATASET CLASSIFICATION RULE:
+    - Detect dataset type from column names, values, AND structure.
+    - If the dataset appears to be analytical (rankings, reports, statistics,
+      financials, leaderboards): lock this type and do not reclassify.
 
     - Entity: has identifiers, text-heavy, profile of people/things
     - Transactional: identifiers + monetary/date, event-oriented
-    - Analytical: mostly numeric, metric-heavy, high variance
+    - Analytical: mostly numeric, metric-heavy, ranking/reporting data
     """
     if not profile.columns:
         return "unknown"
@@ -604,6 +668,19 @@ def _classify_dataset_type(profile: DatasetProfile) -> str:
     total = len(cols)
     if total == 0:
         return "unknown"
+
+    # ── Column-name hint: detect analytical intent from column names ──
+    # If column names suggest ranking, statistics, or reporting data,
+    # lock the dataset type as analytical immediately.
+    analytical_name_count = sum(
+        1 for name in cols if _column_name_suggests_analytical(name)
+    )
+    if analytical_name_count >= 2:
+        logger.info(
+            "Analytical dataset detected via column names (%d analytical-named columns)",
+            analytical_name_count,
+        )
+        return "analytical"
 
     # Count column types
     type_counts: dict[str, int] = collections.Counter()

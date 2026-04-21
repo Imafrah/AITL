@@ -574,7 +574,14 @@ def run_final_cleaning_layer(
                         im[k] = "median"
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # PASS 4: Row quality filtering (mode-aware, NON-DESTRUCTIVE)
+    # PASS 4: Row quality filtering (NON-DESTRUCTIVE)
+    #
+    # ROW DELETION POLICY:
+    # - Do NOT delete rows unless ALL meaningful fields are missing or unreadable.
+    # - Partial nulls, missing years, and missing optional fields are NOT
+    #   reasons to delete a row.
+    # - Confidence score alone is NOT a reason to delete a row.
+    # - Analytical datasets: NEVER drop rows, NEVER apply strict filtering.
     # ═══════════════════════════════════════════════════════════════════════════
 
     before_filter = len(working)
@@ -587,54 +594,21 @@ def run_final_cleaning_layer(
     if dataset_type == "analytical":
         logger.info("Analytical dataset — row filtering SKIPPED (non-destructive)")
         kept = list(working)
-    elif cfg.clean_mode == "strict":
-        logger.info("Strict mode | critical fields: %s", critical_fields)
-        for r in working:
-            # General missing-ratio filter
-            if _missing_ratio(r, schema_keys) > 0.25:
-                continue
-
-            # Critical fields must not be null
-            critical_missing = any(
-                not _is_present(r.get(cf)) for cf in critical_fields
-            )
-            if critical_missing:
-                continue
-
-            # Email columns must be valid
-            email_bad = False
-            for ek in email_cols:
-                ev = r.get(ek)
-                if not _is_present(ev) or not is_valid_email(str(ev)):
-                    email_bad = True
-                    break
-            if email_cols and email_bad:
-                continue
-
-            # Numeric fields must not be missing
-            numeric_bad = any(
-                not _is_present(r.get(nk)) for nk in numeric_cols
-            )
-            if numeric_cols and numeric_bad:
-                continue
-
-            kept.append(r)
     else:
-        # SAFE mode: only remove rows when 2+ critical fields are missing
-        # and row is truly corrupted (not just partially incomplete)
         for r in working:
-            # Check if row has ANY meaningful data
-            content_vals = [
-                r.get(k) for k in schema_keys
-                if _is_present(r.get(k))
-            ]
-            if not content_vals:
+            # Only drop rows where ALL meaningful fields are missing.
+            # A row with at least one meaningful (non-reserved) field is KEPT.
+            has_any_meaningful = False
+            for k in content_keys:
+                if _is_present(r.get(k)):
+                    has_any_meaningful = True
+                    break
+
+            if not has_any_meaningful:
                 # Completely empty row — safe to drop
                 continue
 
-            missing_critical_n = sum(1 for cf in critical_fields if not _is_present(r.get(cf)))
-            if missing_critical_n >= 2:
-                continue
+            # Email remove_row strategy is an explicit user opt-in
             if cfg.email_invalid_strategy == "remove_row":
                 drop = False
                 for ek in email_cols:
@@ -643,6 +617,7 @@ def run_final_cleaning_layer(
                         break
                 if drop:
                     continue
+
             kept.append(r)
 
     removed = before_filter - len(kept)
@@ -736,15 +711,9 @@ def run_final_cleaning_layer(
                 if bval is not None:
                     r[bk] = bval
 
-        # Mode-aware critical filtering in final shaping (strict only)
-        # SAFE mode filtering already done in PASS 4
-        # ANALYTICAL datasets: NEVER drop rows in final shaping
-        if cfg.clean_mode == "strict" and dataset_type != "analytical":
-            final_critical = final_profile.critical_columns if final_profile.columns else critical_fields
-            missing_crit_n = sum(1 for cf in final_critical if not _is_present(r.get(cf)))
-            if missing_crit_n >= 1:
-                dropped_for_critical += 1
-                continue
+        # ROW DELETION POLICY: Do NOT delete rows with partial data here.
+        # PASS 4 already removed completely-empty rows. No further filtering.
+        # Analytical datasets: NEVER drop rows in final shaping.
 
         # NON-DESTRUCTIVE null handling:
         # - Analytical: NEVER fill nulls (preserve original data)

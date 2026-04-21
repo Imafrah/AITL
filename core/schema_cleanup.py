@@ -16,6 +16,7 @@ import re
 from typing import Any
 
 from core.cleaning import amount_from_value, is_valid_date, is_valid_email
+from core.data_profiler import _column_name_suggests_monetary
 from parsers.csv_parser import normalize_field_name
 
 logger = logging.getLogger(__name__)
@@ -102,9 +103,10 @@ def clean_schema(record: dict[str, Any], semantic_map: dict[str, Any] | None) ->
         if isinstance(v, str) and v.strip():
             s = v.strip()
             if re.fullmatch(r"[\s$€£₹-]*\d[\d,.\s$€£₹%-]*", s):
-                # RULE: If this is a bare small integer, do NOT coerce.
-                # Let the column-level profiler decide the type from context.
-                if _is_bare_small_integer_string(s):
+                # RULE: If this is a bare small integer AND the column name
+                # does NOT suggest monetary intent, do NOT coerce.
+                # But if the name says salary/revenue/cost/etc., always coerce.
+                if _is_bare_small_integer_string(s) and not _column_name_suggests_monetary(k):
                     logger.debug(
                         "Coercion skipped for bare small integer string=%r in field=%r",
                         s, k,

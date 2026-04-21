@@ -158,10 +158,14 @@ class TestProfilerColumnDetection:
         )
 
     def test_numeric_detected_by_value_pattern(self):
-        """Columns with mostly numbers should be numeric (not monetary when no currency symbols)."""
+        """Columns with mostly numbers should be numeric. Column-name monetary keywords override to monetary."""
         records = _sample_records()
         types = detect_field_types(records)
-        assert "salary" in types["numeric"], f"salary should be numeric, got {types}"
+        # 'salary' is now classified as 'monetary' (not 'numeric') because
+        # the column name contains 'salary' — a monetary keyword.
+        # This is CORRECT per the rule: "If a column name suggests salary,
+        # treat it as monetary regardless of value size."
+        assert "salary" in types["monetary"], f"salary should be monetary, got {types}"
 
     def test_categorical_detected_for_low_cardinality(self):
         """Low-cardinality text columns should be categorical."""
@@ -177,11 +181,15 @@ class TestProfilerColumnDetection:
 
 class TestDatasetTypeClassification:
     def test_entity_dataset(self):
-        """Text-heavy with identifiers and contact info → entity."""
+        """Text-heavy with identifiers, contact info, and salary → transactional.
+        
+        With the column-name monetary rule, 'salary' is now typed 'monetary'.
+        A dataset with identifier + monetary + date → transactional.
+        """
         records = _sample_records()
         profile = profile_dataset(records)
-        assert profile.dataset_type == "entity", (
-            f"Expected entity, got {profile.dataset_type}. "
+        assert profile.dataset_type == "transactional", (
+            f"Expected transactional, got {profile.dataset_type}. "
             f"Types: {[(n, c.inferred_type) for n, c in profile.columns.items()]}"
         )
 
@@ -414,14 +422,14 @@ class TestOutputModes:
         )
 
     def test_strict_mode_removes_low_quality(self):
-        """STRICT mode should remove rows with >25% missing data."""
+        """STRICT mode only removes rows where ALL meaningful fields are missing."""
         records = [
             {"name": "Alice", "role": "admin", "status": "active", "a": 1, "b": 2, "c": 3, "d": 4},
-            {"name": "Bob", "role": "user", "status": "inactive", "a": None, "b": None, "c": 3, "d": 4},
+            {"name": None, "role": None, "status": None, "a": None, "b": None, "c": None, "d": None},
             {"name": "Carol", "role": "user", "status": "active", "a": 1, "b": 2, "c": 3, "d": 4},
         ]
         cleaned, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
-        assert stats["low_quality_removed"] >= 1, "Strict mode should remove low-quality rows"
+        assert stats["low_quality_removed"] >= 1, "Strict mode should remove completely-empty rows"
 
     def test_strict_removes_more_than_safe(self):
         """Strict mode must always remove >= safe mode rows."""
@@ -431,32 +439,34 @@ class TestOutputModes:
         assert strict_stats["low_quality_removed"] >= safe_stats["low_quality_removed"]
 
     def test_strict_removes_invalid_email_rows(self):
-        """STRICT mode removes rows where any email column is invalid."""
+        """STRICT mode with email_invalid_strategy=remove_row removes bad email rows."""
         records = [
             {"person_name": "Alice", "email": "alice@test.com", "amount": 90},
             {"person_name": "Bob", "email": "not-an-email", "amount": 85},
             {"person_name": "Carol", "email": "carol@test.com", "amount": 92},
             {"person_name": "Dave", "email": None, "amount": 88},
         ]
-        cleaned, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
+        cleaned, stats = run_final_cleaning_layer(
+            records, config=_cfg(clean_mode="strict", email_invalid_strategy="remove_row")
+        )
         # Bob (invalid email) and Dave (null email) should be removed
         remaining_names = [r.get("person_name") for r in cleaned]
-        assert "Bob" not in remaining_names, "Strict should remove invalid email rows"
-        assert "Dave" not in remaining_names, "Strict should remove null email rows"
+        assert "Bob" not in remaining_names, "Should remove invalid email rows when strategy=remove_row"
+        assert "Dave" not in remaining_names, "Should remove null email rows when strategy=remove_row"
         assert "Alice" in remaining_names
         assert "Carol" in remaining_names
 
     def test_strict_removes_null_critical_fields(self):
-        """STRICT mode removes rows where critical fields are null."""
+        """STRICT mode removes rows where ALL fields are null (completely empty)."""
         records = [
             {"name": "Alice", "amount": 100, "status": "Active"},
             {"name": "Bob", "amount": 200, "status": "Active"},
             {"name": "Carol", "amount": 300, "status": "Active"},
-            {"name": None, "amount": None, "status": None},  # all critical null
+            {"name": None, "amount": None, "status": None},  # all fields null → completely empty
             {"name": "Eve", "amount": 500, "status": "Active"},
         ]
         cleaned, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
-        # The row with all nulls should be removed
+        # The row with ALL nulls should be removed
         assert stats["low_quality_removed"] >= 1
         assert len(cleaned) < len(records)
 
@@ -492,16 +502,17 @@ class TestOutputModes:
         assert strict_stats["clean_mode"] == "strict"
 
     def test_strict_numeric_must_be_present(self):
-        """STRICT mode requires numeric fields to be present."""
+        """Row deletion only when ALL meaningful fields are missing.
+        Partial nulls (e.g. missing numerics) do NOT trigger row deletion."""
         records = [
             {"name": "A", "email": "a@t.com", "dept": "Eng", "role": "admin", "status": "active", "score": 90, "grade": 85, "rank": 1},
             {"name": "B", "email": "b@t.com", "dept": "Mkt", "role": "user", "status": "inactive", "score": None, "grade": None, "rank": None},
             {"name": "C", "email": "c@t.com", "dept": "Eng", "role": "user", "status": "active", "score": 88, "grade": 80, "rank": 3},
         ]
         cleaned, stats = run_final_cleaning_layer(records, config=_cfg(clean_mode="strict"))
-        # Row B has 0/3 numeric fields → should be removed
+        # Row B has partial nulls but still has meaningful data (name, email, dept) → KEPT
         remaining_names = [r.get("name") for r in cleaned]
-        assert "B" not in remaining_names, "Strict should remove rows with missing numeric fields"
+        assert "B" in remaining_names, "Partial nulls should NOT trigger row deletion"
 
     def test_safe_removes_only_when_two_or_more_critical_missing(self):
         records = [

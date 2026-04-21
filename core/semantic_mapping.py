@@ -17,6 +17,7 @@ from core.data_profiler import (
     _looks_like_email,
     _looks_like_phone,
     _looks_like_date,
+    _column_name_suggests_monetary,
     profile_column,
 )
 from parsers.csv_parser import normalize_field_name
@@ -66,6 +67,10 @@ def classify_fields(columns: list[str], sample_rows: list[dict[str, Any]] | None
             cp = profile_column(orig, values)
 
             role = _type_to_role(cp.inferred_type, semantic_confidence_high=cp.semantic_confidence_high)
+            # Column-name override: if the name suggests monetary intent
+            # and values are numeric, force the amount_monetary role.
+            if not role and cp.inferred_type in ("numeric", "monetary") and _column_name_suggests_monetary(orig):
+                role = "amount_monetary"
             if role:
                 field_map.setdefault(role, []).append(orig)
                 used.add(orig)
